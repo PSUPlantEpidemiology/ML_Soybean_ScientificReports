@@ -1,0 +1,4251 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# LIME (Local Interpretable Model-agnostic Explanations) 
+## Notes
+Adapted from [Visualizing ML Models with LIME](https://uc-r.github.io/lime).  
+
+The use of machine learning techniques for inferential or predictive purposes shouldn’t prevent us from using linear models for interpretation. In fact, using local linear approximations of more complex machine-learned functions to derive explanations is one of the most popular current approaches. This technique has become known as *local interpretable model-agnostic explanations* (LIME). algorithm. The LIME technique is model agnostic and can be used to interpret nearly any set of machine learning inputs and machine learning predictions. 
+
+Local surrogate models are simple models of complex models, but they are trained only for certain, interesting rows of data. LIME is a prescribed method for building local linear surrogate models around single observations. There is the key the assumption that every complex model is linear on a local scale and the  assertion that it is possible to fit a simple model around a single observation that will mimic how the global model behaves at that locality. The simple model can then be used to explain the predictions of the more complex model locally.
+
+Local interpretations help us understand model predictions for a single row of data or a group of similar rows. We wish to understand *why* the particular predicted response was made.
+
+The `explain` output is a data frame containing different information on the simple model predictions. Most importantly, for each local observation it contains the simple model fit (model_r2) and the weighted importance (feature_weight) for each important feature (feature_desc) that best describes the local relationship.  
+
+However, the simplest approach to interpret the results is to visualize them. The `plot_features function` will create a visualization containing an individual plot for each observation (case 1, 2, …, n) in our local observations data frame. If we specified `n_features = 10`, it will plot the 10 most influential variables that best explain the linear model in that observation's local region and whether the variable causes an increase in yield (supports) or a decrease in yield (contradicts). It also provides us with the model fit for each model (“Explanation Fit: XX”), which allows us to see how well that model explains the local region. 
+
+
+```{r lime_ranger_functions, eval=TRUE, echo=FALSE, results='hide'}
+# the model we created directly with ranger is not supported
+
+# We can work with this pretty easily by building two functions that make lime compatible with an unsupported package. 
+# First, we need to create a model_type function that specifies what type of model this unsupported package is using. model_type is a lime specific function, we just need to create a ranger specific method. We do this by taking the class name for our ranger object and creating the model_type.ranger method and simply return the type of model (“regression”)
+
+# get the model class
+class(rfo)
+## [1] "ranger"
+
+# need to create custom model_type function
+model_type.ranger <- function(x, ...) {
+  # Function tells lime() what model type we are dealing with
+  # 'classification', 'regression', 'survival', 'clustering', 'multilabel', etc
+  return("regression")
+}
+
+model_type(rfo)
+
+
+# We then need to create a predict_model method for ranger as well. The output for this function should be a data frame. For a regression problem it should produce a single column data frame with the predicted response.
+
+# need to create custom predict_model function
+predict_model.ranger <- function(x, newdata, ...) {
+  # Function performs prediction and returns data frame with Response
+  pred <- predict(x, newdata)
+  return(as.data.frame(pred$predictions))
+}
+
+predict_model(rfo, newdata = datII) %>% head()
+```
+
+
+```{r lime_explainer, eval=TRUE, echo=FALSE}
+# Create an explainer object with ranger fit model:
+explainer_rfo <- lime::lime(x = x, model = rfo, n_bins = 10)
+```
+
+
+```{r lime_tuning_functions, eval=TRUE, echo=FALSE}
+lime_tune <- function(x, width) {
+  # tune the lime explain function
+  #
+  # Args:
+  #  x = a data.frame of the predictors for the obs
+  #  width = the width of the exponential kernel
+  #
+  # Returns:
+  # the mean r2 of the model used for the explanation
+  set.seed(100)
+  fit <- lime::explain(
+    x = x,
+    explainer = explainer_rfo, 
+    n_permutations = 5000,
+    # make less for testing:
+    # n_permutations = 100,
+    dist_fun = "manhattan",
+    kernel_width = width,
+    n_features = 10, 
+    feature_select = "lasso_path"
+    )
+  return(mean(fit$model_r2))
+}
+
+lime_explain_tuned <- function(x, width) {
+  # fit the tuned lime explain function
+  #
+  # Args:
+  #  x = a data.frame of the predictors for the obs
+  #  width = the width of the exponential kernel
+  #
+  # Returns:
+  # the explanation object
+  set.seed(100)
+  fit <- lime::explain(
+    x = x,
+    explainer = explainer_rfo, 
+    n_permutations = 5000,
+    # make less for testing:
+    # n_permutations = 100,
+    dist_fun = "manhattan",
+    kernel_width = width,
+    n_features = 10, 
+    feature_select = "lasso_path"
+    )
+  return(fit)
+}
+```
+
+
+## Local observations to examine? {.tabset .tabset-fade .tabset-pills}
+```{r lime_TED_map_setup, eval=TRUE, echo=FALSE, results='hide'}
+# Number of TEDs per state: (at least 12 per state)
+dat %>% dplyr::group_by(state) %>% dplyr::summarise(n_distinct(TED))
+
+# 96 TEDs (sort from the ones with largest number of fields). The 1st 10 TEDs each have >100 obs:
+dat %>% dplyr::count(TED) %>% dplyr::arrange(-n)  %>% print(n = Inf)
+
+# Filter to the top 12 TEDs:
+top.12.TEDs <- dat %>% dplyr::count(TED) %>% dplyr::arrange(-n) %>% dplyr::slice(1:12) %>% dplyr::pull(TED)
+
+dat %>% dplyr::filter(TED %in% top.12.TEDs) %>% nrow()  # 1,688 rows
+
+# Set up for mapping:
+states <- sf::st_as_sf(maps::map("state", plot = FALSE, fill = TRUE))
+# Subset to the states of interest:
+soy2 <- states %>%
+  subset(ID %in% c("iowa", "illinois", "indiana", "kansas", "michigan", "minnesota", "nebraska", "north dakota", "south dakota", "ohio", "wisconsin"))
+
+PlotMap <- function(ff, fi, colr) {
+  # Plots field locations for the top 12 TEDs, filtered by foliar fungicide/insecticide use
+  #
+  # Args:
+  #  ff = character string for foliar fungicide use
+  #  fi = character string for foliar insecticide use
+  #  colr = string for which colour to use for the points
+  #
+  # Returns:
+  #  a map of the fields panelled by TED
+  ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs, foliar.fungicide == ff, foliar.insecticide == fi), 
+             aes(x = longitude, y = latitude), size = 1.1, alpha = 0.5, colour = colr) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) 
+}
+```
+
+Would like to examine small sets of local observations, but which ones?
+
+Start with TEDs, and look at fields within each TED that were sprayed with foliar fungicides.
+
+However, in the data used for the model, there are almost 100 TEDs! Note that there are multiple TEDs per state, so looking at fields by state is not productive.
+
+### No. fields per TED
+```{r lime_no_fields_per_TED, eval=TRUE, echo=FALSE}
+dat %>%
+  dplyr::add_count(TED) %>%
+  dplyr::select(TED, n) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(TED = factor(TED)) %>%
+  # Arrange data by no. fields:
+  dplyr::arrange(n) %>%
+  dplyr::mutate(TED = factor(TED, levels = .$TED)) %>%
+  ggplot2::ggplot(., aes(x = n, y = TED)) +
+  geom_point() +        
+  theme_bw() +
+  xlab("No. of fields") +
+  ylab("TED") + 
+  theme(axis.title.x = element_text(face = "bold", size = 11),
+        axis.title.y = element_text(face = "bold", size = 11),
+        axis.text.y = element_text(size = 4))
+```
+
+
+### Top 12 TEDs
+A listing of the number of fungicide-treated and nontreated fields in each of the top 12 TEDs.
+
+```{r lime_TED_Top12_Table, eval=TRUE, echo=FALSE}
+dat %>%
+  dplyr::filter(TED %in% top.12.TEDs) %>%
+  dplyr::group_by(TED) %>%
+  dplyr::summarise(n = n(), ff.y = sum(foliar.fungicide == "yes"), ff.n = sum(foliar.fungicide == "no")) %>%
+  dplyr::arrange(desc(n)) %>%
+  knitr::kable(., row.names = TRUE, align = "lccc", col.names = c("TED", "No. fields", "Fungicide applied", "No fungicide")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+
+### TED notation
+Need to understand the TED notation.
+
+*  The first digit of a TED is the coarse (7-category) root zone plant-available water holding capacity (RZPAWHC).
+
+*  The 2nd to 3rd digits is the GDD (10-category) variable.
+
+*  The 4th digit is the annual aridity index (AI) (lower indicates more arid).
+
+*  Temperature seasonality is a 3-category variable. HOWEVER: all fields have the same value (03).
+
+```{r lime_TED_meaning, eval=TRUE, echo=FALSE}
+dat %>%
+  dplyr::filter(TED %in% top.12.TEDs) %>%
+  dplyr::distinct(TED) %>%
+  dplyr::arrange(TED) %>%
+  # The 1st digit of a TED is the coarse root zone plant-available water holding capacity (RZPAWHC):
+  dplyr::mutate(RZPAWHC_code = stringr::str_sub(as.character(TED), 1, 1)) %>%
+  dplyr::mutate(RZPAWHC = factor(RZPAWHC_code, levels = c(3, 4, 5, 6), labels = c("100-150 mm", "150-200 mm", "200-250 mm", "250–300 mm"))) %>%
+  # The 2nd-3rd digits represent the GDD variable:
+  dplyr::mutate(GDD_code = stringr::str_sub(as.character(TED), 2, 3)) %>%
+  dplyr::mutate(GDD = factor(GDD_code, levels = c("02", "03", "04"), labels = c("2671-3169", "3170-3791", "3792-4829"))) %>%
+  # The 4th digit is the annual aridity index (AI) (lower indicates more arid):
+  dplyr::mutate(AI_code = stringr::str_sub(as.character(TED), 4, 4)) %>%
+  dplyr::mutate(AI = factor(AI_code, levels = c(3, 5, 6, 7, 8), labels = c("4792-5689", "6589-7785", "7786-8685", "8686-10181", "10182-12876"))) %>%
+  # Temperature seasonality is a 3-category variable taking on the values 01, 02, 03
+  # HOWEVER: all fields have the same value (03)
+  knitr::kable(., row.names = TRUE, align = "lcccccc") %>%  
+    kableExtra::kable_styling(fixed_thead = TRUE, bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+
+### Field locations {.tabset .tabset-fade .tabset-pills}
+If we filter the TEDs by the number of fields in a TED, then the top 12 TEDs each have over 90 fields apiece. So let's focus on these 12 TEDs. That's still 1,688 observations. 
+
+Begin by plotting the field locations in each of these 12 TEDs.  
+
+#### By year
+Color the points by year (2014-2016).
+
+```{r lime_TED_map_top12_by_year, eval=TRUE, echo=FALSE}
+# Map the field locations for the top 12 TEDs
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs), 
+             aes(x = longitude, y = latitude, colour = factor(year)), alpha = 0.5, size = 1.1) +
+  # scale_colour_viridis_d(alpha = 0.5, begin = 0.1, end = 1) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, all fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+#### By MG
+Color the points by maturity group.
+```{r lime_TED_map_top12_by_MG, eval=TRUE, echo=FALSE}
+# Map the field locations for the top 12 TEDs
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs), 
+             aes(x = longitude, y = latitude, colour = MG.f), alpha = 0.5, size = 1.1) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical")
+```
+
+
+### Top 12 TEDs (fungicides applied) {.tabset .tabset-fade .tabset-pills}
+The field locations in each of these 12 TEDs, further filtered to those in which foliar fungicides were used.
+
+#### By year
+```{r lime_TED_map_top12_fungicide_year, eval=TRUE, echo=FALSE}
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs, foliar.fungicide == "yes"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, foliar fungicides used") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+#### By MG
+```{r lime_TED_map_top12_fungicide_MG, eval=TRUE, echo=FALSE}
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs, foliar.fungicide == "yes"), 
+             aes(x = longitude, y = latitude, colour = MG.f), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1)))
+```
+
+
+
+
+```{r lime_local_obs_TED_map_funN_insN, eval=FALSE, echo=FALSE}
+# Some further plots:
+### foliar fungicide = no, foliar insecticide = no
+PlotMap(ff = "no", fi = "no", colr = "coral2")
+```
+
+```{r lime_local_obs_TED_map_funY_insN, eval=FALSE, echo=FALSE}
+# Further plots:
+### foliar fungicide = yes, foliar insecticide = no
+PlotMap(ff = "yes", fi = "no", colr = "royalblue1")
+```
+
+```{r lime_local_obs_TED_map_funN_insY, eval=FALSE, echo=FALSE}
+# Further plots:
+### foliar fungicide = no, foliar insecticide = yes
+PlotMap(ff = "no", fi = "yes", colr = "green3")
+```
+
+```{r lime_local_obs_TED_map_funY_insY, eval=FALSE, echo=FALSE}
+# Further plots:
+### foliar fungicide = yes, foliar insecticide = yes
+PlotMap(ff = "yes", fi = "yes", colr = "magenta1")
+```
+
+
+```{r lime_TED_functions, eval=TRUE, echo=FALSE}
+TEDHY <- function(getTED, x, fung) {
+  # Get the x best-yielding fields in a given TED
+  # Args:
+  #  getTED = a numeric for the TED
+  #  x = a numeric for the x best-yielding fields in the TED
+  #  fung = "yes" or "no" for foliar fungicide use
+  # Returns:
+  #  a data.frame of the obs for plotting the field locations
+  #
+  dat %>% 
+    dplyr::filter(TED == getTED, foliar.fungicide == fung) %>% 
+    # Arrange from high to low yield:
+    dplyr::arrange(-yield) %>%
+    dplyr::slice(1:x) %>%
+    # Top x fields in terms of yield:
+    # select columns needed for plotting:
+    dplyr::select(TED, year, latitude, longitude)
+} # end TEDHY function
+
+
+TEDLY <- function(getTED, x, fung) {
+  # Get the x worst-yielding fields in a given TED
+  # Args:
+  #  getTED = a numeric for the TED
+  #  x = a numeric for the x worst-yielding fields in the TED
+  #  fung = "yes" or "no" for foliar fungicide use
+  # Returns:
+  #  a data.frame of the obs for plotting the field locations
+  #
+  dat %>% 
+    dplyr::filter(TED == getTED, foliar.fungicide == fung) %>% 
+    # Arrange from low to high yield:
+    dplyr::arrange(yield) %>%
+    dplyr::slice(1:x) %>%
+    # The x worst-yielding fields:
+    # select columns needed for plotting:
+    dplyr::select(TED, year, latitude, longitude)
+}  # end TEDLY function
+
+
+TEDHYPredData <- function(getTED, x, fung) {
+  # Get the input predictor data for the x best-yielding fields in a given TED
+  # Args:
+  #  getTED = a numeric for the TED
+  #  x = a numeric for the x best-yielding fields in the TED
+  #  fung = "yes" or "no" for foliar fungicide use
+  #
+  # Returns:
+  #  a data.frame of the local obs for input into lime
+  #
+  dat %>% 
+    dplyr::mutate(sample_id = 1:nrow(.)) %>%
+    dplyr::filter(TED == getTED, foliar.fungicide == fung) %>% 
+    # Arrange from high to low yield:
+    dplyr::arrange(-yield) %>%
+    dplyr::slice(1:x) %>%
+    # cannot have these columns for lime input:
+    dplyr::select(-order, -state, -year, -longitude, -yield) %>%
+    # NOTE: TED, sample_id are not part of the lime input data, but need it here as an id (for now):
+    dplyr::select(TED, sample_id, everything())
+}  # end TEDHYPredData function
+
+
+TEDLYPredData <- function(getTED, x, fung) {
+  # Get the input predictor data for the x worst-yielding fields in a given TED
+  # Args:
+  #  getTED = a numeric for the TED
+  #  x = a numeric for the x worst-yielding fields in the TED
+  #  fung = "yes" or "no" for foliar fungicide use
+  #
+  # Returns:
+  #  a data.frame of the local obs for input into lime
+  #
+  dat %>% 
+    dplyr::mutate(sample_id = 1:nrow(.)) %>%
+    dplyr::filter(TED == getTED, foliar.fungicide == fung) %>% 
+    # Arrange from low to high yield:
+    dplyr::arrange(yield) %>%
+    dplyr::slice(1:x) %>%
+    # Easier to read the output from highest to lowest yield in the lime plots:
+    dplyr::arrange(-yield) %>%
+    # cannot have these columns for lime input:
+    dplyr::select(-order, -state, -year, -longitude, -yield) %>%
+    # NOTE: TED, sample_id are not part of the lime input data, but need it here as an id (for now):
+    dplyr::select(TED, sample_id, everything())
+}  # end TEDLYPredData function
+
+
+TEDYieldSummaryTable <- function (i, obj) {
+  # Calculates the min and max yield for the fields in a given TED in the fitted lime tuned object
+  # Args:
+  #  i = a numeric (1:12) corresponding to the position of the TED in the nested tibble
+  #  obj = the nested tibble of the TEDs and tuned lime objects
+  #
+  # Returns:
+  #  a kableExtra-formatted table of the min and max yield for the fields in the given TED
+  #
+  dat %>% 
+  dplyr::filter(1:nrow(.) %in% {obj %>% purrr::pluck("id", i)}) %>% 
+  dplyr::select(yield) %>% 
+  purrr::map_df(., function(.x) {return(data.frame(no.fls = length(.x), min.yld = min(.x), max.yld = max(.x)))}) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+}  # end TEDYieldSummaryTable function
+
+
+FeatureSelectTable <- function(obj, i) {
+  # Table the number of times a feature was selected in an explanation over the number of fields 
+  # Args:
+  #  obj = a nested tibble with the fitted lime explanation
+  #  i = index for which of the nested data frames to extract (1-12 typically for the top 12 TEDs)
+  #
+  # Returns:
+  # a kable-styled table of the feature, the number of times it was selected and the total number of fields in the local observation set
+  #
+  no.cases <- obj %>% purrr::pluck("expl", i) %>% dplyr::select(case) %>% dplyr::distinct() %>% count() %>% pull()
+  
+  obj %>% purrr::pluck("expl", i) %>% dplyr::count(feature) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lcc", col.names = c("Feature", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+  scroll_box(width = "400px", height = "400px")
+}  # end FeatureSelectTable function
+
+
+FeatureDescTable <- function(obj, i) {
+  # Table the number of times a feature description appeared in an explanation over the number of fields 
+  # Args:
+  #  obj = a nested tibble with the fitted lime explanation
+  #  i = index for which of the nested data frames to extract (1-12 typically for the top 12 TEDs)
+  #
+  # Returns:
+  # a kable-styled table of the feature, feature description, the number of times the description appeared and the total number of fields in the local observation set
+  #
+  no.cases <- obj %>% purrr::pluck("expl", i) %>% dplyr::select(case) %>% dplyr::distinct() %>% count() %>% pull()
+  
+  obj %>% purrr::pluck("expl", i)  %>% dplyr::group_by(feature) %>% dplyr::count(feature_desc) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lccc", col.names = c("Feature", "Feature description", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+  scroll_box(width = "500px", height = "400px")
+}  # end function FeatureDescTable
+
+
+FeatureDescWtPlot <- function(obj, i, wt) {
+  # Estimates and plots a weighted version of negative and positive feature weights for all feature descriptions
+  # Args:
+  #  obj = a nested tibble with the fitted lime explanation
+  #  i = index for which of the nested data frames to extract (1-12 typically for the top 12 TEDs)
+  #  wt = character string ("pos" or "neg") for whether we want to extract features with positive or negative weights
+  #
+  # Returns:
+  # a ggplot of the weighed feature description weights facetted by the features
+  #
+  no.cases <- obj %>% purrr::pluck("expl", i) %>% dplyr::select(case) %>% dplyr::distinct() %>% count() %>% pull()
+  
+  obj %>% purrr::pluck("expl", i) %>% 
+  dplyr::mutate(wtdir = ifelse(feature_weight > 0, "pos", "neg")) %>% 
+  dplyr::mutate(no.cases = no.cases) %>%
+  dplyr::group_by(feature, feature_desc, wtdir) %>% 
+  dplyr::summarise(n = n(), no.cases = mean(no.cases), fw.sum = sum(feature_weight), wtd.sum = n*fw.sum/no.cases) %>%
+  # filter by weight direction:
+  dplyr::filter(wtdir == wt) %>%
+  ggplot(., mapping = aes(x = reorder(feature_desc, desc(feature_desc)), y = wtd.sum)) +
+  geom_point() +
+  facet_wrap(~feature, scales = "free_y", ncol = 3) +
+  coord_flip() +
+  theme_bw() +
+  ylab("Weighted sum of feature weights") +
+  xlab("Feature description") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6))
+}  # end FeatureDescWtPlot function
+```
+
+
+```{r LoadSavedLimeObjects, eval=TRUE, echo=FALSE}
+# These lime tuning steps take a looong time, so I saved the tuned objects:
+# save(HYF, LYF, HYNF, LYNF, AllHYF, AllHYNF, AllLYF, AllLYNF, HQF, HQNF, MGHYF, MGHYNF, file = "FittedLimeObjects.RData")
+
+# and just reload them here:
+# load("~/EskerSoybean/ScientificReportsGitHub/Analysis/FittedLimeObjectsII.RData")
+
+load("../Data/FittedLimeObjectsII.RData")
+```
+
+
+
+## Top 12 TEDs: fungicide-treated: 20 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+
+*  Can do for all 12 TEDs.  
+*  NOTE: TED 403603 has only 17 fields that were fungicide-treated.
+*  In plotting the features in an explanation, we'll do this separately for each TED.  
+*  Also, because there are 20 observations in each local set, we'll have to plot then in smaller groups at a time for the graphics to size appropriately.
+
+### The field locations
+```{r lime_TEDHYF, eval=TRUE, echo=FALSE}
+TEDHYFung <- purrr::map_dfr(c(303603, 303703, 403603, 403703, 504803, 602303, 603503, 603603, 603703, 604503, 604603, 604803), TEDHY, x = 20, fung = "yes")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDHYFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, foliar fungicides used, 20 highest-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_TEDHYF_Setup, eval=FALSE, echo=FALSE}
+# Prep the input predictor data:
+TEDHY.Fung.Data <- purrr::map_dfr(c(303603, 303703, 403603, 403703, 504803, 602303, 603503, 603603, 603703, 604503, 604603, 604803), TEDHYPredData, x = 20, fung = "yes")
+
+# Create a tibble where the data for each TED is nested:
+# NOTE: this takes quite some processing time, so we use furrr functions to speed up things.
+HYF <- 
+  TEDHY.Fung.Data %>% 
+  # Nest the data by TED:
+  dplyr::group_by(TED) %>% 
+  tidyr::nest() %>%
+  # Sample id column:
+  dplyr::mutate(id = purrr::map(data, dplyr::pull, sample_id)) %>%
+  # Set the row names of the data to the sample ids:
+  dplyr::mutate(data = purrr::map(data, tibble::remove_rownames)) %>%
+  dplyr::mutate(data = purrr::map(data, tibble::column_to_rownames, var = "sample_id")) %>%
+  ## Tune the lime width parameter:
+  # A column for the width parameter grid:
+  tibble::add_column(., width_param = list(c(1.0, 1.5, 2.0))) %>%
+  # Tune the lime explain function:
+  dplyr::mutate(rsq = furrr::future_map2(data, width_param, function(.data, .width_param)
+    purrr::modify(.width_param, lime_tune, x = .data))) %>%
+  # Get the tuned width:
+  dplyr::mutate(opt_width = purrr::map2_dbl(width_param, rsq, function(.width_param, .rsq)
+    .width_param[which.max(.rsq)])) %>%
+  # The tuned lime explain object:
+  dplyr::mutate(expl = furrr::future_map2(data, opt_width, lime_explain_tuned))
+```
+
+
+### TED 303603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_303603, eval=TRUE, echo=FALSE}
+i <- 1
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_303603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_303603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_303603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+These next sections require some description. The heatmap plots a color-coded version of the feature weights. We'll attempt to dig into the weights deeper.
+
+#### No. times a feature was selected
+Over all the fields in the local observation set, for how many fields was a feature selected by the local lime model? This can give some indication of the "importance" of a given feature over the set of fields. 
+
+```{r lime_Feature_HYF_TED_303603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+Features can have several levels or values (e.g. categorical, or where continuous features are split). For each selected feature value, how many times does it appear over the set of fields in the observation set? 
+
+```{r lime_FeatureDesc_HYF_TED_303603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+\  
+
+The next two sections may be a bit more controversial. If we look at the feature weights, we could have in some cases a large weight, but the feature value appears only once or twice. In other cases, a feature value may appear in several observations, but have lower weights. How do we get an idea of the relative importance of feature weights?
+
+The method proposed is this:  
+
+*  sum the positive (negative) weights for each feature value that appears (`s`)  
+*  then multiply `s` by `n` (the number of observations the feature value appears in)   
+*  finally, divide `s n` by `t` (the total number of observations)   
+*  this gives a weighted version of the feature weights  
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_303603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_303603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 303703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_303703, eval=TRUE, echo=FALSE}
+i <- 2
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_303703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_303703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_303703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_303703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_303703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_303703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_303703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_403603, eval=TRUE, echo=FALSE}
+i <- 3
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_403603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_403603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_403603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_403603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_403603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_403603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_403603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_403703, eval=TRUE, echo=FALSE}
+i <- 4
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_403703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_403703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_403703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_403703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_403703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_403703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_403703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_504803, eval=TRUE, echo=FALSE}
+i <- 5
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_504803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_504803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_504803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 602303 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_602303, eval=TRUE, echo=FALSE}
+i <- 6
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_602303_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_602303_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_602303, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_602303, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_602303, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_602303, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_602303, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_603503, eval=TRUE, echo=FALSE}
+i <- 7
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_603503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_603503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_603503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_603603, eval=TRUE, echo=FALSE}
+i <- 8
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_603603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_603603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_603603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_603703, eval=TRUE, echo=FALSE}
+i <- 9
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_603703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_603703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_603703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_604503, eval=TRUE, echo=FALSE}
+i <- 10
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_604503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_604503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_604503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_604503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_604503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_604503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_604503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_604603, eval=TRUE, echo=FALSE}
+i <- 11
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_604603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_604603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_604603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYF_TED_604803, eval=TRUE, echo=FALSE}
+i <- 12
+TEDYieldSummaryTable(i = i, obj = HYF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYF %>% purrr::pluck("expl", i)), cases = (HYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYF_TED_604803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYF_TED_604803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYF_TED_604803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+## Top TEDs: fungicide-treated: 20 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+
+*  Can do only for TEDs: 504803, 603503, 603603, 603703, 604603, 604803.
+*  Because need TEDs with 40 or more fungicide-treated fields to group into high-yield and low-yield fields (where fungicides were applied)
+
+### The field locations
+```{r lime_TEDLYF, eval=TRUE, echo=FALSE}
+TEDLYFung <- purrr::map_dfr(c(504803, 603503, 603603, 603703, 604603, 604803), TEDLY, x = 20, fung = "yes")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDLYFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top TEDs, foliar fungicides used, 20 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_TEDLYF_Setup, eval=FALSE, echo=FALSE}
+# Prep the input predictor data:
+TEDLY.Fung.Data <- purrr::map_dfr(c(504803, 603503, 603603, 603703, 604603, 604803), TEDLYPredData, x = 20, fung = "yes")
+
+# Create a tibble where the data for each TED is nested:
+LYF <- 
+  TEDLY.Fung.Data %>% 
+  # Nest the data by TED:
+  dplyr::group_by(TED) %>% 
+  tidyr::nest() %>%
+  # Sample id column:
+  dplyr::mutate(id = purrr::map(data, dplyr::pull, sample_id)) %>%
+  # Set the row names of the data to the sample ids:
+  dplyr::mutate(data = purrr::map(data, tibble::remove_rownames)) %>%
+  dplyr::mutate(data = purrr::map(data, tibble::column_to_rownames, var = "sample_id")) %>%
+  ## Tune the lime width parameter:
+  # A column for the width parameter grid:
+  tibble::add_column(., width_param = list(c(1.0, 1.5, 2.0))) %>%
+  # Tune the lime explain function:
+  dplyr::mutate(rsq = furrr::future_map2(data, width_param, function(.data, .width_param)
+    purrr::modify(.width_param, lime_tune, x = .data))) %>%
+  # Get the tuned width:
+  dplyr::mutate(opt_width = purrr::map2_dbl(width_param, rsq, function(.width_param, .rsq)
+    .width_param[which.max(.rsq)])) %>%
+  # The tuned lime explain object:
+  dplyr::mutate(expl = furrr::future_map2(data, opt_width, lime_explain_tuned))
+```  
+
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYF_TED_504803, eval=TRUE, echo=FALSE}
+i <- 1
+TEDYieldSummaryTable(i = i, obj = LYF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYF_TED_504803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYF_TED_504803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYF_TED_504803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYF_TED_603503, eval=TRUE, echo=FALSE}
+i <- 2
+TEDYieldSummaryTable(i = i, obj = LYF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYF_TED_603503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYF_TED_603503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYF_TED_603503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYF_TED_603603, eval=TRUE, echo=FALSE}
+i <- 3
+TEDYieldSummaryTable(i = i, obj = LYF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYF_TED_603603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYF_TED_603603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYF_TED_603603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYF_TED_603703, eval=TRUE, echo=FALSE}
+i <- 4
+TEDYieldSummaryTable(i = i, obj = LYF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYF_TED_603703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYF_TED_603703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYF_TED_603703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYF_TED_604603, eval=TRUE, echo=FALSE}
+i <- 5
+TEDYieldSummaryTable(i = i, obj = LYF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYF_TED_604603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYF_TED_604603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYF_TED_604603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYF_TED_604803, eval=TRUE, echo=FALSE}
+i <- 6
+TEDYieldSummaryTable(i = i, obj = LYF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYF %>% purrr::pluck("expl", i)), cases = (LYF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYF_TED_604803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYF_TED_604803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYF_TED_604803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+## Top 12 TEDs: no fungicides applied: 20 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+
+* Can do for all 12 TEDs.
+
+### The field locations
+```{r lime_TEDHYNF, eval=TRUE, echo=FALSE}
+TEDHYNFung <- purrr::map_dfr(c(303603, 303703, 403603, 403703, 504803, 602303, 603503, 603603, 603703, 604503, 604603, 604803), TEDHY, x = 20, fung = "no")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDHYNFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, no foliar fungicides used, 20 highest-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_TEDHYNF_Setup, eval=FALSE, echo=FALSE}
+# Prep the input predictor data:
+TEDHY.NFung.Data <- purrr::map_dfr(c(303603, 303703, 403603, 403703, 504803, 602303, 603503, 603603, 603703, 604503, 604603, 604803), TEDHYPredData, x = 20, fung = "no")
+
+# Create a tibble where the data for each TED is nested:
+# NOTE: this takes quite some processing time, so we use furrr functions to speed up things.
+HYNF <- 
+  TEDHY.NFung.Data %>% 
+  # Nest the data by TED:
+  dplyr::group_by(TED) %>% 
+  tidyr::nest() %>%
+  # Sample id column:
+  dplyr::mutate(id = purrr::map(data, dplyr::pull, sample_id)) %>%
+  # Set the row names of the data to the sample ids:
+  dplyr::mutate(data = purrr::map(data, tibble::remove_rownames)) %>%
+  dplyr::mutate(data = purrr::map(data, tibble::column_to_rownames, var = "sample_id")) %>%
+  ## Tune the lime width parameter:
+  # A column for the width parameter grid:
+  tibble::add_column(., width_param = list(c(1.0, 1.5, 2.0))) %>%
+  # Tune the lime explain function:
+  dplyr::mutate(rsq = furrr::future_map2(data, width_param, function(.data, .width_param)
+    purrr::modify(.width_param, lime_tune, x = .data))) %>%
+  # Get the tuned width:
+  dplyr::mutate(opt_width = purrr::map2_dbl(width_param, rsq, function(.width_param, .rsq)
+    .width_param[which.max(.rsq)])) %>%
+  # The tuned lime explain object:
+  dplyr::mutate(expl = furrr::future_map2(data, opt_width, lime_explain_tuned))
+```
+
+
+### TED 303603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_303603, eval=TRUE, echo=FALSE}
+i <- 1
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_303603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_303603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_303603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_303603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_303603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_303603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_303603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 303703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_303703, eval=TRUE, echo=FALSE}
+i <- 2
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_303703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_303703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_303703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_303703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_303703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_303703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_303703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_403603, eval=TRUE, echo=FALSE}
+i <- 3
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_403603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_403603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_403603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_403603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_403603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_403603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_403603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403703 {.tabset .tabset-fade .tabset-pills}
+##### Yield summary
+```{r lime_TableHYNF_TED_403703, eval=TRUE, echo=FALSE}
+i <- 4
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_403703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_403703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_403703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_403703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_403703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_403703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_403703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_504803, eval=TRUE, echo=FALSE}
+i <- 5
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_504803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_504803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_504803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 602303 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_602303, eval=TRUE, echo=FALSE}
+i <- 6
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_602303_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_602303_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_602303, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_602303, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_602303, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_602303, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_602303, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_603503, eval=TRUE, echo=FALSE}
+i <- 7
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_603503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_603503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_603503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_603603, eval=TRUE, echo=FALSE}
+i <- 8
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_603603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_603603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_603603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_603703, eval=TRUE, echo=FALSE}
+i <- 9
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_603703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_603703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_603703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_604503, eval=TRUE, echo=FALSE}
+i <- 10
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_604503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_604503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_604503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_604503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_604503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_604503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_604503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_604603, eval=TRUE, echo=FALSE}
+i <- 11
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_604603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_604603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_604603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableHYNF_TED_604803, eval=TRUE, echo=FALSE}
+i <- 12
+TEDYieldSummaryTable(i = i, obj = HYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotHYNF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotHYNF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(HYNF %>% purrr::pluck("expl", i)), cases = (HYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_HYNF_TED_604803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(HYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HYNF_TED_604803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = HYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HYNF_TED_604803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = HYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HYNF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HYNF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = HYNF, i = i, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+## Top 12 TEDs: no fungicides applied: 20 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+* Can do for all 12 TEDs.  
+
+### The field locations
+```{r lime_TEDLYNF, eval=TRUE, echo=FALSE}
+TEDLYNFung <- purrr::map_dfr(sort(top.12.TEDs), TEDLY, x = 20, fung = "no")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDLYNFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, no foliar fungicides used, 20 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_TEDLYNF_Setup, eval=FALSE, echo=FALSE}
+# Prep the input predictor data:
+TEDLY.NFung.Data <- purrr::map_dfr(sort(top.12.TEDs), TEDLYPredData, x = 20, fung = "no")
+
+# Create a tibble where the data for each TED is nested:
+# NOTE: this takes quite some processing time, so we use furrr functions to speed up things.
+LYNF <- 
+  TEDLY.NFung.Data %>% 
+  # Nest the data by TED:
+  dplyr::group_by(TED) %>% 
+  tidyr::nest() %>%
+  # Sample id column:
+  dplyr::mutate(id = purrr::map(data, dplyr::pull, sample_id)) %>%
+  # Set the row names of the data to the sample ids:
+  dplyr::mutate(data = purrr::map(data, tibble::remove_rownames)) %>%
+  dplyr::mutate(data = purrr::map(data, tibble::column_to_rownames, var = "sample_id")) %>%
+  ## Tune the lime width parameter:
+  # A column for the width parameter grid:
+  tibble::add_column(., width_param = list(c(1.0, 1.5, 2.0))) %>%
+  # Tune the lime explain function:
+  dplyr::mutate(rsq = furrr::future_map2(data, width_param, function(.data, .width_param)
+    purrr::modify(.width_param, lime_tune, x = .data))) %>%
+  # Get the tuned width:
+  dplyr::mutate(opt_width = purrr::map2_dbl(width_param, rsq, function(.width_param, .rsq)
+    .width_param[which.max(.rsq)])) %>%
+  # The tuned lime explain object:
+  dplyr::mutate(expl = furrr::future_map2(data, opt_width, lime_explain_tuned))
+```
+
+
+### TED 303603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_303603, eval=TRUE, echo=FALSE}
+i <- 1
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_303603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_303603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_303603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_303603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_303603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_303603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_303603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 303703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_303703, eval=TRUE, echo=FALSE}
+i <- 2
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_303703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_303703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_303703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_303703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_303703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_303703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_303703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_403603, eval=TRUE, echo=FALSE}
+i <- 3
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_403603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_403603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_403603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_403603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_403603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_403603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_403603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_403703, eval=TRUE, echo=FALSE}
+i <- 4
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_403703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_403703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_403703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_403703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_403703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_403703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_403703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_504803, eval=TRUE, echo=FALSE}
+i <- 5
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_504803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_504803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_504803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_504803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 602303 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_602303, eval=TRUE, echo=FALSE}
+i <- 6
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_602303_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_602303_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_602303, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_602303, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_602303, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_602303, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_602303, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_603503, eval=TRUE, echo=FALSE}
+i <- 7
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_603503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_603503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_603503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_603503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_603603, eval=TRUE, echo=FALSE}
+i <- 8
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_603603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_603603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_603603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_603603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_603703, eval=TRUE, echo=FALSE}
+i <- 9
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_603703, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_603703, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_603703, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_603703, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604503 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_604503, eval=TRUE, echo=FALSE}
+i <- 10
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_604503_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_604503_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_604503, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_604503, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_604503, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_604503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_604503, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_604603, eval=TRUE, echo=FALSE}
+i <- 11
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_604603, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_604603, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_604603, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_604603, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Yield summary
+```{r lime_TableLYNF_TED_604803, eval=TRUE, echo=FALSE}
+i <- 12
+TEDYieldSummaryTable(i = i, obj = LYNF)
+```
+
+#### Fields 1:10
+```{r lime_plotLYNF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[1:10], ncol = 3)
+```
+
+#### Fields 11:20
+```{r lime_plotLYNF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+lime::plot_features(as.data.frame(LYNF %>% purrr::pluck("expl", i)), cases = (LYNF %>% purrr::pluck("id", i))[11:20], ncol = 3)
+```
+
+#### Heatmap
+```{r lime_HM_LYNF_TED_604803, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(LYNF %>% purrr::pluck("expl", i)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_LYNF_TED_604803, eval=TRUE, echo=FALSE}
+FeatureSelectTable(obj = LYNF, i = i)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_LYNF_TED_604803, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+FeatureDescTable(obj = LYNF, i = i)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_LYNF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_LYNF_TED_604803, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+FeatureDescWtPlot(obj = LYNF, i = i, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+```{r lime_AllTEDs_functions, eval=TRUE, echo=FALSE}
+Alllime_tune <- function(width, x) {
+  # tune the lime explain function
+  #
+  # Args:
+  #  width = the width of the exponential kernel
+  #  x = data frame of the predictors for the obs
+  #
+  # Returns:
+  # the mean r2 of the model used for the explanation
+  set.seed(100)
+  fit <- lime::explain(
+    x = x,
+    explainer = explainer_rfo, 
+    n_permutations = 5000,
+    # make less for testing:
+    # n_permutations = 100,
+    dist_fun = "manhattan",
+    kernel_width = width,
+    n_features = 10, 
+    feature_select = "lasso_path"
+    )
+  return(mean(fit$model_r2))
+}  # end Alllime_tune function
+
+
+Alllime_explain_tuned <- function(width, x) {
+  # fit the tuned lime explain function
+  #
+  # Args:
+  #  width = the width of the exponential kernel
+  #  x = a data.frame of the predictors for the obs
+  #
+  # Returns:
+  # the explanation object
+  set.seed(100)
+  fit <- lime::explain(
+    x = x,
+    explainer = explainer_rfo, 
+    n_permutations = 5000,
+    # make less for testing:
+    # n_permutations = 100,
+    dist_fun = "manhattan",
+    kernel_width = width,
+    n_features = 10, 
+    feature_select = "lasso_path"
+    )
+  return(fit)
+} # end Alllime_explain_tuned function
+
+
+AllTEDHY <- function(x, fung) {
+  # Get the x best-yielding fields (over all TEDs)
+  # Args:
+  #  x = a numeric for the x best-yielding fields
+  #  fung = "yes" or "no" for foliar fungicide use
+  # Returns:
+  #  a data.frame of the obs for plotting the field locations
+  #
+  dat %>% 
+    dplyr::filter(foliar.fungicide == fung) %>% 
+    # Arrange from high to low yield:
+    dplyr::arrange(-yield) %>%
+    dplyr::slice(1:x) %>%
+    # Top x fields in terms of yield:
+    # select columns needed for plotting:
+    dplyr::select(TED, year, latitude, longitude)
+} # end AllTEDHY function
+
+
+AllTEDLY <- function(x, fung) {
+  # Get the x worst-yielding fields (over all TEDs)
+  # Args:
+  #  x = a numeric for the x worst-yielding fields
+  #  fung = "yes" or "no" for foliar fungicide use
+  # Returns:
+  #  a data.frame of the obs for plotting the field locations
+  #
+  dat %>% 
+    dplyr::filter(foliar.fungicide == fung) %>% 
+    # Arrange from low to high yield:
+    dplyr::arrange(yield) %>%
+    dplyr::slice(1:x) %>%
+    # The x worst-yielding fields:
+    # select columns needed for plotting:
+    dplyr::select(TED, year, latitude, longitude)
+}  # end AllTEDLY function
+
+
+AllTEDHYPredData <- function(x, fung) {
+  # Get the input predictor data for the x best-yielding fields (over all TEDs)
+  # Args:
+  #  x = a numeric for the x best-yielding fields
+  #  fung = "yes" or "no" for foliar fungicide use
+  #
+  # Returns:
+  #  a data.frame of the local obs for input into lime
+  #
+  dat %>% 
+    dplyr::mutate(sample_id = 1:nrow(.)) %>%
+    dplyr::filter(foliar.fungicide == fung) %>% 
+    # Arrange from high to low yield:
+    dplyr::arrange(-yield) %>%
+    dplyr::slice(1:x) %>%
+    # cannot have these columns for lime input:
+    dplyr::select(-TED, -order, -state, -year, -longitude, -yield) %>%
+    # NOTE: sample_id not part of the lime input data, but need it here as an id (for now):
+    dplyr::select(sample_id, everything())
+}  # end AllTEDHYPredData function
+
+
+AllTEDLYPredData <- function(x, fung) {
+  # Get the input predictor data for the x worst-yielding fields (over all TEDs)
+  # Args:
+  #  x = a numeric for the x worst-yielding fields
+  #  fung = "yes" or "no" for foliar fungicide use
+  #
+  # Returns:
+  #  a data.frame of the local obs for input into lime
+  #
+  dat %>% 
+    dplyr::mutate(sample_id = 1:nrow(.)) %>%
+    dplyr::filter(foliar.fungicide == fung) %>% 
+    # Arrange from low to high yield:
+    dplyr::arrange(yield) %>%
+    dplyr::slice(1:x) %>%
+    # Easier to read the output from highest to lowest yield in the lime plots:
+    dplyr::arrange(-yield) %>%
+    # cannot have these columns for lime input:
+    dplyr::select(-TED, -order, -state, -year, -longitude, -yield) %>%
+    # NOTE: sample_id not part of the lime input data, but need it here as an id (for now):
+    dplyr::select(sample_id, everything())
+}  # end AllTEDLYPredData function
+
+
+AllFeatureSelectTable <- function(obj) {
+  # Table the number of times a feature was selected in an explanation over the number of fields 
+  # Args:
+  #  obj = a fitted lime explanation object
+  #
+  # Returns:
+  # a kable-styled table of the feature, the number of times it was selected and the total number of fields in the local observation set
+  #
+  no.cases <- obj %>% dplyr::select(case) %>% dplyr::distinct() %>% count() %>% pull()
+  
+  obj %>% dplyr::count(feature) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lcc", col.names = c("Feature", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+  scroll_box(width = "400px", height = "400px")
+}  # end AllFeatureSelectTable function
+
+AllFeatureDescTable <- function(obj) {
+  # Table the number of times a feature description appeared in an explanation over the number of fields 
+  # Args:
+  #  obj = a fitted lime explanation object
+  #
+  # Returns:
+  # a kable-styled table of the feature, feature description, the number of times the description appeared and the total number of fields in the local observation set
+  #
+  no.cases <- obj %>% dplyr::select(case) %>% dplyr::distinct() %>% count() %>% pull()
+  
+  obj %>% dplyr::group_by(feature) %>% dplyr::count(feature_desc) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lccc", col.names = c("Feature", "Feature description", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+  scroll_box(width = "500px", height = "400px")
+}  # end function AllFeatureDescTable
+
+AllFeatureDescWtPlot <- function(obj, wt) {
+  # Estimates and plots a weighted version of negative and positive feature weights for all feature descriptions
+  # Args:
+  #  obj = a fitted lime explanation object
+  #  wt = character string ("pos" or "neg") for whether we want to extract features with positive or negative weights
+  #
+  # Returns:
+  # a ggplot of the weighed feature description weights facetted by the features
+  #
+  no.cases <- obj %>% dplyr::select(case) %>% dplyr::distinct() %>% count() %>% pull()
+  
+  obj %>%  
+  dplyr::mutate(wtdir = ifelse(feature_weight > 0, "pos", "neg")) %>% 
+  dplyr::mutate(no.cases = no.cases) %>%
+  dplyr::group_by(feature, feature_desc, wtdir) %>% 
+  dplyr::summarise(n = n(), no.cases = mean(no.cases), fw.sum = sum(feature_weight), wtd.sum = n*fw.sum/no.cases) %>%
+  # filter by weight direction:
+  dplyr::filter(wtdir == wt) %>%
+  ggplot(., mapping = aes(x = reorder(feature_desc, desc(feature_desc)), y = wtd.sum)) +
+  geom_point() +
+  facet_wrap(~feature, scales = "free_y", ncol = 3) +
+  coord_flip() +
+  theme_bw() +
+  ylab("Weighted sum of feature weights") +
+  xlab("Feature description") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6))
+}  # end AllFeatureDescWtPlot function
+```
+
+
+## All TEDs: fungicide-treated: 100 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r lime_AllTEDHYF, eval=TRUE, echo=FALSE}
+# AllTEDHY(x = 100, fung = "yes")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDHY(x = 100, fung = "yes"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, foliar fungicides applied, 100 best-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_AllTEDHYF_Setup, eval=FALSE, echo=FALSE, message=FALSE}
+## Prep the input predictor data:
+AllHYFDat <- 
+  AllTEDHYPredData(x = 100, fung = "yes") %>% 
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id")
+  
+## Tune the lime width parameter:
+width_param <- c(1.0, 1.5, 2.0)
+AllHYF <- 
+  width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = AllHYFDat) %>% 
+  # furrr::future_map_dbl(., Alllime_tune, x = AllHYFDat) %>% 
+  which.max(.) %>%
+  width_param[.] %>%
+  Alllime_explain_tuned(., x = AllHYFDat)
+```
+
+
+### Yield summary
+```{r lime_TableAllTEDHYF, eval=TRUE, echo=FALSE}
+dat %>%  
+  dplyr::filter(1:nrow(.) %in% {AllTEDHYPredData(x = 100, fung = "yes") %>% dplyr::pull(sample_id)}) %>%
+  dplyr::summarise(n = n(), minyld = min(yield), maxyld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+```{r lime_plotAllTEDHYF, eval=FALSE, echo=FALSE}
+# This is a check on the lime explanations:
+cases <- AllTEDHYPredData(x = 100, fung = "yes") %>% dplyr::slice(1:10) %>% dplyr::pull(sample_id)
+
+lime::plot_features(as.data.frame(AllHYF), cases = cases, ncol = 3)
+```
+
+### Heatmap
+```{r lime_HM_AllTEDHYF, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(AllHYF)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.7))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.7)))
+```
+
+### No. times a feature was selected
+```{r lime_Feature_AllTEDHYF, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = AllHYF)
+```
+
+### No. times a feature description appeared
+```{r lime_FeatureDesc_AllTEDHYF, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = AllHYF)
+```
+
+### Positive feature weights
+```{r lime_FeatureDescPosWt_AllTEDHYF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllHYF, wt = "pos")
+```
+
+### Negative feature weights
+```{r lime_FeatureDescNegWt_AllTEDHYF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllHYF, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+## All TEDs: fungicide-treated: 100 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r lime_AllTEDLYF, eval=TRUE, echo=FALSE}
+# AllTEDLY(x = 100, fung = "yes")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDLY(x = 100, fung = "yes"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, foliar fungicides applied, 100 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_AllTEDLYF_Setup, eval=FALSE, echo=FALSE, message=FALSE}
+## Prep the input predictor data:
+AllLYFDat <- 
+  AllTEDLYPredData(x = 100, fung = "yes") %>% 
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id")
+  
+## Tune the lime width parameter:
+width_param <- c(1.0, 1.5, 2.0)
+AllLYF <- 
+  width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = AllLYFDat) %>% 
+  # furrr::future_map_dbl(., Alllime_tune, x = AllLYFDat) %>% 
+  which.max(.) %>%
+  width_param[.] %>%
+  Alllime_explain_tuned(., x = AllLYFDat)
+```
+
+
+### Yield summary
+```{r lime_TableAllTEDLYF, eval=TRUE, echo=FALSE}
+dat %>%  
+  dplyr::filter(1:nrow(.) %in% {AllTEDLYPredData(x = 100, fung = "yes") %>% dplyr::pull(sample_id)}) %>%
+  dplyr::summarise(n = n(), minyld = min(yield), maxyld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+```{r lime_plotAllTEDLYF, eval=FALSE, echo=FALSE}
+# This is a check on the lime explanations:
+cases <- AllTEDLYPredData(x = 100, fung = "yes") %>% dplyr::slice(1:10) %>% dplyr::pull(sample_id)
+
+lime::plot_features(as.data.frame(AllLYF), cases = cases, ncol = 3)
+```
+
+### Heatmap
+```{r lime_HM_AllTEDLYF, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(AllLYF)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.6))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.6)))
+```
+
+### No. times a feature was selected
+```{r lime_Feature_AllTEDLYF, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = AllLYF)
+```
+
+### No. times a feature description appeared
+```{r lime_FeatureDesc_AllTEDLYF, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = AllLYF)
+```
+
+### Positive feature weights
+```{r lime_FeatureDescPosWt_AllTEDLYF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllLYF, wt = "pos")
+```
+
+### Negative feature weights
+```{r lime_FeatureDescNegWt_AllTEDLYF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllLYF, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+## All TEDs: no fungicide: 100 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r lime_AllTEDHYNF, eval=TRUE, echo=FALSE}
+# AllTEDHY(x = 100, fung = "no")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDHY(x = 100, fung = "no"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, no foliar fungicides, 100 best-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_AllTEDHYNF_Setup, eval=FALSE, echo=FALSE, message=FALSE}
+## Prep the input predictor data:
+AllHYNFDat <- 
+  AllTEDHYPredData(x = 100, fung = "no") %>% 
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id")
+  
+## Tune the lime width parameter:
+width_param <- c(1.0, 1.5, 2.0)
+AllHYNF <- 
+  width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = AllHYNFDat) %>% 
+  # furrr::future_map_dbl(., Alllime_tune, x = AllHYNFDat) %>% 
+  which.max(.) %>%
+  width_param[.] %>%
+  Alllime_explain_tuned(., x = AllHYNFDat)
+```
+
+
+### Yield summary
+```{r lime_TableAllTEDHYNF, eval=TRUE, echo=FALSE}
+dat %>%  
+  dplyr::filter(1:nrow(.) %in% {AllTEDHYPredData(x = 100, fung = "no") %>% dplyr::pull(sample_id)}) %>%
+  dplyr::summarise(n = n(), minyld = min(yield), maxyld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+```{r lime_plotAllTEDHYNF, eval=FALSE, echo=FALSE}
+# This is a check on the lime explanations:
+cases <- AllTEDHYPredData(x = 100, fung = "no") %>% dplyr::slice(1:10) %>% dplyr::pull(sample_id)
+
+lime::plot_features(as.data.frame(AllHYNF), cases = cases, ncol = 3)
+```
+
+### Heatmap
+```{r lime_HM_AllTEDHYNF, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(AllHYNF)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.6))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.6)))
+```
+
+### No. times a feature was selected
+```{r lime_Feature_AllTEDHYNF, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = AllHYNF)
+```
+
+### No. times a feature description appeared
+```{r lime_FeatureDesc_AllTEDHYNF, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = AllHYNF)
+```
+
+### Positive feature weights
+```{r lime_FeatureDescPosWt_AllTEDHYNF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllHYNF, wt = "pos")
+```
+
+### Negative feature weights
+```{r lime_FeatureDescNegWt_AllTEDHYNF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllHYNF, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+## All TEDs: no fungicide: 100 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r lime_AllTEDLYNF, eval=TRUE, echo=FALSE}
+# AllTEDLY(x = 100, fung = "no")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDLY(x = 100, fung = "no"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, no foliar fungicides, 100 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_AllTEDLYNF_Setup, eval=FALSE, echo=FALSE, message=FALSE}
+## Prep the input predictor data:
+AllLYNFDat <- 
+  AllTEDLYPredData(x = 100, fung = "no") %>% 
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id")
+  
+## Tune the lime width parameter:
+width_param <- c(1.0, 1.5, 2.0)
+AllLYNF <- 
+  width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = AllLYNFDat) %>% 
+  # furrr::future_map_dbl(., Alllime_tune, x = AllLYNFDat) %>% 
+  which.max(.) %>%
+  width_param[.] %>%
+  Alllime_explain_tuned(., x = AllLYNFDat)
+```
+
+
+### Yield summary
+```{r lime_TableAllTEDLYNF, eval=TRUE, echo=FALSE}
+dat %>%  
+  dplyr::filter(1:nrow(.) %in% {AllTEDLYPredData(x = 100, fung = "no") %>% dplyr::pull(sample_id)}) %>%
+  dplyr::summarise(n = n(), minyld = min(yield), maxyld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+```{r lime_plotAllTEDLYNF, eval=FALSE, echo=FALSE}
+# This is a check on the lime explanations:
+cases <- AllTEDLYPredData(x = 100, fung = "no") %>% dplyr::slice(1:10) %>% dplyr::pull(sample_id)
+
+lime::plot_features(as.data.frame(AllLYNF), cases = cases, ncol = 3)
+```
+
+### Heatmap
+```{r lime_HM_AllTEDLYNF, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(AllLYNF)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.6))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.6)))
+```
+
+### No. times a feature was selected
+```{r lime_Feature_AllTEDLYNF, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = AllLYNF)
+```
+
+### No. times a feature description appeared
+```{r lime_FeatureDesc_AllTEDLYNF, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = AllLYNF)
+```
+
+### Positive feature weights
+```{r lime_FeatureDescPosWt_AllTEDLYNF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllLYNF, wt = "pos")
+```
+
+### Negative feature weights
+```{r lime_FeatureDescNegWt_AllTEDLYNF, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = AllLYNF, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+## A focus on the highest-yield fields {.tabset .tabset-fade .tabset-pills}
+This section was motivated after going through the top 12 TEDs (fungicide-treated fields), and seeing that there were some very-high-yield fields (up to or above 80 bu).
+
+Here, we look at the subset of fields for which yield was above the 90th quantile. This subset contains roughly the same number of fields in the `fungicide applied` and the `no fungicide` groups, and the yield statistics are about the same as well. So comparing these two groups should be interesting. 
+
+### Yield summary
+```{r lime_TableHQ, eval=TRUE, echo=FALSE}
+dat %>% 
+  dplyr::filter(yield > quantile(yield, 0.90)) %>% 
+  dplyr::group_by(foliar.fungicide) %>%
+  dplyr::summarise(n = n(), mean.yld = mean(yield), min.yld = min(yield), max.yld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "lcccc", col.names = c("Fungicide use", "No. of fields", "Mean yield", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+
+### The field locations
+```{r lime_HQ, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% dplyr::filter(yield > quantile(yield, 0.90)), 
+             aes(x = longitude, y = latitude, colour = foliar.fungicide), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Foliar fungicide", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Fields in the top 10th quantile for yield") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+```{r lime_HQ_Setup_I, eval=FALSE, echo=FALSE, message=FALSE}
+## NOTE: not running this chunk because I think the heatmaps are more interpretable keeping the fungicide sprayed and unsprayed fields separate.
+
+## Prep the input predictor data:
+HQdat <- 
+  dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id") %>%
+  # cannot have these columns for lime input:
+  dplyr::select(-TED, -order, -state, -year, -longitude, -yield)
+
+  
+# NOTE: Ran into furrr failing with the 272 observations in HQdat. Going to try the tuning with purrr (don't know how long it will take). Will just have to use the optimized width manually.
+width_param <- c(1.0, 1.5, 2.0)
+width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = HQdat) %>% 
+  which.max(.) %>%
+  width_param[.]  # returned 1.5
+
+
+## The tuned explainer object:
+HQ.tuned <- Alllime_explain_tuned(1.5, x = HQdat)
+```
+
+```{r lime_plotHQ_I, eval=FALSE, echo=FALSE}
+# This is a check on the lime explanations:
+cases <- dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  dplyr::slice(1:10) %>%
+  dplyr::pull(sample_id)
+
+lime::plot_features(as.data.frame(HQ.tuned), cases = cases, ncol = 3)
+```
+
+```{r lime_plotHQ_HM_I, eval=FALSE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(HQ.tuned)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.6))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.6)))
+```
+
+
+```{r lime_HQ_Setup_II, eval=FALSE, echo=FALSE, message=FALSE}
+## Prep the input predictor data:
+# foliar fungicides applied
+HQdatF <- 
+  dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  dplyr::filter(foliar.fungicide == "yes") %>%
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id") %>%
+  # cannot have these columns for lime input:
+  dplyr::select(-TED, -order, -state, -year, -longitude, -yield)
+
+# no foliar fungicides used
+HQdatNF <- 
+  dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  dplyr::filter(foliar.fungicide == "no") %>%
+  # Set the row names of the data to the sample ids:
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames(var = "sample_id") %>%
+  # cannot have these columns for lime input:
+  dplyr::select(-TED, -order, -state, -year, -longitude, -yield)
+
+## Tuning:
+width_param <- c(1.0, 1.5, 2.0)
+
+HQF <- 
+  width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = HQdatF) %>% 
+  # furrr::future_map_dbl(., Alllime_tune, x = HQdatF) %>% 
+  which.max(.) %>%
+  width_param[.] %>%
+  Alllime_explain_tuned(., x = HQdatF)
+
+HQNF <- 
+  width_param %>%
+  purrr::map_dbl(., Alllime_tune, x = HQdatNF) %>%
+  # furrr::future_map_dbl(., Alllime_tune, x = HQdatNF) %>%
+  which.max(.) %>%
+  width_param[.] %>%
+  Alllime_explain_tuned(., x = HQdatNF)
+```
+
+```{r lime_plotHQ_II, eval=FALSE, echo=FALSE}
+# This is a check on the lime explanations:
+cases <- dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  dplyr::filter(foliar.fungicide == "yes") %>%
+  dplyr::slice(1:10) %>%
+  dplyr::pull(sample_id)
+
+lime::plot_features(as.data.frame(HQF), cases = cases, ncol = 3)
+```
+
+### Fungicides applied {.tabset .tabset-fade .tabset-pills}
+#### Heatmap
+```{r lime_HM_HQF_II, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(HQF)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.6))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.6)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HQF_II, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = HQF)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HQF_II, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = HQF)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HQF_II, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = HQF, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HQF_II, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = HQF, wt = "neg")
+```
+
+
+### No fungicides used {.tabset .tabset-fade .tabset-pills}
+#### Heatmap 
+```{r lime_HM_HQNF_II, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=10.0}
+lime::plot_explanations(as.data.frame(HQNF)) +
+  theme(axis.title.x = element_text(face = "bold", size = 12)) +
+  theme(axis.text.x = element_text(size = rel(0.6))) +
+  theme(axis.title.y = element_text(face = "bold", size = 12)) +
+  theme(axis.text.y = element_text(size = rel(0.6)))
+```
+
+#### No. times a feature was selected
+```{r lime_Feature_HQNF_II, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = HQNF)
+```
+
+#### No. times a feature description appeared
+```{r lime_FeatureDesc_HQNF_II, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = HQNF)
+```
+
+#### Positive feature weights
+```{r lime_FeatureDescPosWt_HQNF_II, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = HQNF, wt = "pos")
+```
+
+#### Negative feature weights
+```{r lime_FeatureDescNegWt_HQNF_II, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = HQNF, wt = "neg")
+```
+
+
+-------------------------------------------------------------------------------------------------------
+
+
+## By Maturity group {.tabset .tabset-fade .tabset-pills}
+***
+
+Look at the top 50 highest-yielding fungicide-treated fields and non-treated fields in each maturity group.
+
+```{r lime_MG_functions, eval=TRUE, echo=FALSE}
+MGHY <- function(getMG, x, fung) {
+  # Get the x best-yielding fields in a given MG
+  # Args:
+  #  getMG = a character string for the MG
+  #  x = a numeric for the x best-yielding fields in a MG
+  #  fung = "yes" or "no" for foliar fungicide use
+  # Returns:
+  #  a data.frame of the obs for plotting the field locations
+  #
+  dat %>% 
+    dplyr::filter(MG.f == getMG, foliar.fungicide == fung) %>% 
+    # Arrange from high to low yield:
+    dplyr::arrange(-yield) %>%
+    dplyr::slice(1:x) %>%
+    # Top x fields in terms of yield:
+    # select columns needed for plotting:
+    dplyr::select(MG.f, yield, year, latitude, longitude)
+} # end MGHY function
+
+# example of use:
+# MGHY(getMG = "0", x = 50, fung = "no")
+
+
+MGHYPredData <- function(getMG, x, fung) {
+  # Get the input predictor data for the x best-yielding fields for a given MG
+  # Args:
+  #  getMG = a character string for the MG
+  #  x = a numeric for the x best-yielding fields
+  #  fung = "yes" or "no" for foliar fungicide use
+  #
+  # Returns:
+  #  a data.frame of the local obs for input into lime
+  #
+  dat %>% 
+    dplyr::mutate(sample_id = 1:nrow(.)) %>%
+    # Need a descriptor copy of MG.f when creating nested tibbles later:
+    dplyr::mutate(MG.fD = MG.f) %>%
+    dplyr::filter(MG.f == getMG, foliar.fungicide == fung) %>% 
+    # Arrange from high to low yield:
+    dplyr::arrange(-yield) %>%
+    dplyr::slice(1:x) %>%
+    # cannot have these columns for lime input:
+    dplyr::select(-order, -state, -year, -longitude, -yield, -TED) %>%
+    # NOTE: MG.fD and sample_id are not part of the lime input data, but need it here as an id (for now):
+    dplyr::select(MG.fD, sample_id, everything())
+}  # end MGHYPredData function
+
+
+MGPlotFeatures <- function(x, i, obs) {
+  # Plot the features of a lime explanation for MG
+  # Args:
+  #  x = a tibble where the explanations for each MG are nested (MG 0, I, II, III, IV)
+  #  i = which row of the tibble, corresponding to the MG
+  #  obs = a vector for the observations to be plotted (e.g. 1:10 for the 1st ten obs)
+  #
+  # Returns:
+  #  the lime efatures plot for the obs
+  #
+  lime::plot_features(as.data.frame(x %>% purrr::pluck("expl", i)), cases = (x %>% purrr::pluck("id", i))[obs], ncol = 3)
+} # end function MGPlotFeatures
+```
+
+
+### Locations
+A map of the fields, points colored by fungicide status, panelled by MG.
+```{r lime_HY_MG_Locations, eval=TRUE, echo=FALSE}
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dplyr::bind_rows(
+purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "no") %>% dplyr::mutate(fung = "No"),
+purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "yes") %>% dplyr::mutate(fung = "Yes")),
+aes(x = longitude, y = latitude, colour = factor(fung)), size = 1.3, alpha = 0.5) +
+scale_color_brewer(type = "qual", palette = "Set2", direction = 1) +
+  facet_wrap(~ MG.f) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Fungicide use", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("50 highest-yielding fungicide-treated and untreated fields per MG") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+### Fungicides applied {.tabset .tabset-fade .tabset-pills}
+```{r lime_MG_HYF_Setup, eval=FALSE, echo=FALSE}
+# Prep the input predictor data:
+MGHY.Fung.Data <- purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHYPredData, x = 50, fung = "yes")
+
+# Create a tibble where the data for each MG is nested:
+# NOTE: this takes quite some processing time, so we use furrr functions to speed up things.
+MGHYF <- 
+  MGHY.Fung.Data %>% 
+  # Nest the data by MG:
+  dplyr::group_by(MG.fD) %>% 
+  tidyr::nest() %>%
+  # Sample id column:
+  dplyr::mutate(id = purrr::map(data, dplyr::pull, sample_id)) %>%
+  # Set the row names of the data to the sample ids:
+  dplyr::mutate(data = purrr::map(data, tibble::remove_rownames)) %>%
+  dplyr::mutate(data = purrr::map(data, tibble::column_to_rownames, var = "sample_id")) %>%
+  ## Tune the lime width parameter:
+  # A column for the width parameter grid:
+  tibble::add_column(., width_param = list(c(1.0, 1.5, 2.0))) %>%
+  # Tune the lime explain function:
+  dplyr::mutate(rsq = furrr::future_map2(data, width_param, function(.data, .width_param)
+    purrr::modify(.width_param, lime_tune, x = .data))) %>%
+  # Get the tuned width:
+  dplyr::mutate(opt_width = purrr::map2_dbl(width_param, rsq, function(.width_param, .rsq)
+    .width_param[which.max(.rsq)])) %>%
+  # The tuned lime explain object:
+  dplyr::mutate(expl = furrr::future_map2(data, opt_width, lime_explain_tuned))
+```
+
+
+#### Yield summary
+```{r lime_MG_HYF_Table, eval=TRUE, echo=FALSE}
+purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "yes") %>% 
+  dplyr::group_by(MG.f) %>% 
+  dplyr::summarise(n = n(), min.yld = min(yield), max.yld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "lccc", col.names = c("Maturity group", "No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+
+#### The field locations
+```{r lime_MG_HYF_Locations, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "yes"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ MG.f) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Foliar fungicides used, 50 highest-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+#### MG 0 {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYF_plot_MG0_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 1, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYF_plot_MG0_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 1, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYF_plot_MG0_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 1, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYF_plot_MG0_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 1, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYF_plot_MG0_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 1, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYF_HM_MG0, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYF %>% purrr::pluck("expl", 1)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYF_Feature_MG0, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYF %>% purrr::pluck("expl", 1))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYF_FeatureDesc_MG0, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYF %>% purrr::pluck("expl", 1))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYF_FeatureDescPosWt_MG0, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 1), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYF_FeatureDescNegWt_MG0, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 1), wt = "neg")
+```
+
+
+-----------------------------------------------------------------------------------------------------
+
+#### MG I {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYF_plot_MGI_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 2, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYF_plot_MGI_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 2, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYF_plot_MGI_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 2, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYF_plot_MGI_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 2, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYF_plot_MGI_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 2, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYF_HM_MGI, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYF %>% purrr::pluck("expl", 2)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYF_Feature_MGI, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYF %>% purrr::pluck("expl", 2))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYF_FeatureDesc_MGI, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYF %>% purrr::pluck("expl", 2))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYF_FeatureDescPosWt_MGI, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 2), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYF_FeatureDescNegWt_MGI, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 2), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+
+#### MG II {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYF_plot_MGII_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 3, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYF_plot_MGII_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 3, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYF_plot_MGII_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 3, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYF_plot_MGII_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 3, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYF_plot_MGII_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 3, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYF_HM_MGII, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYF %>% purrr::pluck("expl", 3)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYF_Feature_MGII, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYF %>% purrr::pluck("expl", 3))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYF_FeatureDesc_MGII, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYF %>% purrr::pluck("expl", 3))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYF_FeatureDescPosWt_MGII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 3), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYF_FeatureDescNegWt_MGII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 3), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+#### MG III {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYF_plot_MGIII_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 4, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYF_plot_MGIII_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 4, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYF_plot_MGIII_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 4, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYF_plot_MGIII_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 4, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYF_plot_MGIII_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 4, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYF_HM_MGIII, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYF %>% purrr::pluck("expl", 4)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYF_Feature_MGIII, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYF %>% purrr::pluck("expl", 4))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYF_FeatureDesc_MGIII, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYF %>% purrr::pluck("expl", 4))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYF_FeatureDescPosWt_MGIII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 4), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYF_FeatureDescNegWt_MGIII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 4), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+#### MG IV {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYF_plot_MGIV_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 5, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYF_plot_MGIV_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 5, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYF_plot_MGIV_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYF, i = 5, obs = 21:30)
+```
+
+##### Heatmap
+```{r lime_MG_HYF_HM_MGIV, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYF %>% purrr::pluck("expl", 5)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYF_Feature_MGIV, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYF %>% purrr::pluck("expl", 5))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYF_FeatureDesc_MGIV, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYF %>% purrr::pluck("expl", 5))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYF_FeatureDescPosWt_MGIV, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 5), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYF_FeatureDescNegWt_MGIV, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYF %>% purrr::pluck("expl", 5), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+
+### Fungicides not applied {.tabset .tabset-fade .tabset-pills}
+```{r lime_MG_HYNF_Setup, eval=FALSE, echo=FALSE}
+# Prep the input predictor data:
+MGHY.NFung.Data <- purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHYPredData, x = 50, fung = "no")
+
+# Create a tibble where the data for each MG is nested:
+# NOTE: this takes quite some processing time, so we use furrr functions to speed up things.
+MGHYNF <- 
+  MGHY.NFung.Data %>% 
+  # Nest the data by MG:
+  dplyr::group_by(MG.fD) %>% 
+  tidyr::nest() %>%
+  # Sample id column:
+  dplyr::mutate(id = purrr::map(data, dplyr::pull, sample_id)) %>%
+  # Set the row names of the data to the sample ids:
+  dplyr::mutate(data = purrr::map(data, tibble::remove_rownames)) %>%
+  dplyr::mutate(data = purrr::map(data, tibble::column_to_rownames, var = "sample_id")) %>%
+  ## Tune the lime width parameter:
+  # A column for the width parameter grid:
+  tibble::add_column(., width_param = list(c(1.0, 1.5, 2.0))) %>%
+  # Tune the lime explain function:
+  dplyr::mutate(rsq = furrr::future_map2(data, width_param, function(.data, .width_param)
+    purrr::modify(.width_param, lime_tune, x = .data))) %>%
+  # Get the tuned width:
+  dplyr::mutate(opt_width = purrr::map2_dbl(width_param, rsq, function(.width_param, .rsq)
+    .width_param[which.max(.rsq)])) %>%
+  # The tuned lime explain object:
+  dplyr::mutate(expl = furrr::future_map2(data, opt_width, lime_explain_tuned))
+```
+
+#### Yield summary
+```{r lime_MG_HYNF_Table, eval=TRUE, echo=FALSE}
+purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "no") %>% 
+  dplyr::group_by(MG.f) %>% 
+  dplyr::summarise(n = n(), min.yld = min(yield), max.yld = max(yield)) %>%
+  knitr::kable(., row.names = FALSE, align = "lccc", col.names = c("Maturity group", "No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+
+#### The field locations
+```{r lime_MG_HYNF_Locations, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "no"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ MG.f) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Foliar fungicides not used, 50 highest-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+
+#### MG 0 {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYNF_plot_MG0_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 1, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYNF_plot_MG0_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 1, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYNF_plot_MG0_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 1, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYNF_plot_MG0_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 1, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYNF_plot_MG0_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 1, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYNF_HM_MG0, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYNF %>% purrr::pluck("expl", 1)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYNF_Feature_MG0, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYNF %>% purrr::pluck("expl", 1))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYNF_FeatureDesc_MG0, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYNF %>% purrr::pluck("expl", 1))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYNF_FeatureDescPosWt_MG0, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 1), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYNF_FeatureDescNegWt_MG0, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 1), wt = "neg")
+```
+
+
+-----------------------------------------------------------------------------------------------------
+
+#### MG I {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYNF_plot_MGI_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 2, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYNF_plot_MGI_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 2, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYNF_plot_MGI_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 2, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYNF_plot_MGI_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 2, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYNF_plot_MGI_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 2, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYNF_HM_MGI, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYNF %>% purrr::pluck("expl", 2)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYNF_Feature_MGI, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYNF %>% purrr::pluck("expl", 2))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYNF_FeatureDesc_MGI, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYNF %>% purrr::pluck("expl", 2))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYNF_FeatureDescPosWt_MGI, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 2), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYNF_FeatureDescNegWt_MGI, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 2), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+#### MG II {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYNF_plot_MGII_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 3, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYNF_plot_MGII_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 3, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYNF_plot_MGII_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 3, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYNF_plot_MGII_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 3, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYNF_plot_MGII_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 3, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYNF_HM_MGII, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYNF %>% purrr::pluck("expl", 3)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYNF_Feature_MGII, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYNF %>% purrr::pluck("expl", 3))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYNF_FeatureDesc_MGII, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYNF %>% purrr::pluck("expl", 3))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYNF_FeatureDescPosWt_MGII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 3), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYNF_FeatureDescNegWt_MGII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 3), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+#### MG III {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_plot_MG_HYNF_MGIII_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 4, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_plot_MG_HYNF_MGIII_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 4, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_plot_MG_HYNF_MGIII_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 4, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_plot_MG_HYNF_MGIII_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 4, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_plot_MG_HYNF_MGIII_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 4, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_HM_MG_HYNF_MGIII, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYNF %>% purrr::pluck("expl", 4)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYNF_Feature_MGIII, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYNF %>% purrr::pluck("expl", 4))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYNF_FeatureDesc_MGIII, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYNF %>% purrr::pluck("expl", 4))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYNF_FeatureDescPosWt_MGIII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 4), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYNF_FeatureDescNegWt_MGIII, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 4), wt = "neg")
+```
+
+--------------------------------------------------------------------------------------------------
+
+#### MG IV {.tabset .tabset-fade .tabset-pills}
+##### Explanation features Fields 1:10
+```{r lime_MG_HYNF_plot_MGIV_1to10, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 5, obs = 1:10)
+```
+
+##### Explanation features Fields 11:20
+```{r lime_MG_HYNF_plot_MGIV_11to20, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 5, obs = 11:20)
+```
+
+##### Explanation features Fields 21:30
+```{r lime_MG_HYNF_plot_MGIV_21to30, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 5, obs = 21:30)
+```
+
+##### Explanation features Fields 31:40
+```{r lime_MG_HYNF_plot_MGIV_31to40, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 5, obs = 31:40)
+```
+
+##### Explanation features Fields 41:50
+```{r lime_MG_HYNF_plot_MGIV_41to50, eval=TRUE, echo=FALSE, fig.height=9.5, fig.width=10.0}
+MGPlotFeatures(x = MGHYNF, i = 5, obs = 41:50)
+```
+
+##### Heatmap
+```{r lime_MG_HYNF_HM_MGIV, eval=TRUE, echo=FALSE, fig.height=7.5, fig.width=8.0}
+lime::plot_explanations(as.data.frame(MGHYNF %>% purrr::pluck("expl", 5)))
+```
+
+##### No. times a feature was selected
+```{r lime_MG_HYNF_Feature_MGIV, eval=TRUE, echo=FALSE}
+AllFeatureSelectTable(obj = MGHYNF %>% purrr::pluck("expl", 5))
+```
+
+##### No. times a feature description appeared
+```{r lime_MG_HYNF_FeatureDesc_MGIV, eval=TRUE, echo=FALSE}
+# How many times did a feature description appear?
+AllFeatureDescTable(obj = MGHYNF %>% purrr::pluck("expl", 5))
+```
+
+##### Positive feature weights
+```{r lime_MG_HYNF_FeatureDescPosWt_MGIV, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 5), wt = "pos")
+```
+
+##### Negative feature weights
+```{r lime_MG_HYNF_FeatureDescNegWt_MGIV, eval=TRUE, echo=FALSE, fig.width=8.0, fig.height=7.0}
+AllFeatureDescWtPlot(obj = MGHYNF %>% purrr::pluck("expl", 5), wt = "neg")
+```
+

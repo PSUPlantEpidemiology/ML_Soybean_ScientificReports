@@ -1,0 +1,2866 @@
+---
+title: "Figures for: A machine learning interpretation of the contribution of foliar fungicides to soybean yield in the north‐central United States"
+author: Denis Shah, Thomas Butts, Spyridon Mourtzinis, Juan Rattalino Edreira, Patricio Grassini, Shawn Conley and Paul Esker
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    fig_caption: yes
+    highlight: tango
+    number_sections: true
+    theme: cerulean
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+editor_options: 
+  chunk_output_type: console  
+---
+
+----------------------------------------------------------------------------------------------------
+
+
+```{r setup, include=FALSE, eval=TRUE}
+require(knitr)
+knitr::opts_chunk$set(cache=TRUE, fig.path = 'SoyFigs/')
+```
+
+
+<!--- Load libraries and process data for plotting -->
+```{r libraries, echo=FALSE, eval=TRUE, message=FALSE}
+library(tidyverse)
+# tidyverse_packages(include_self = FALSE)
+# Loads: dplyr forcats ggplot2 lubridate purrr tibble
+
+# For producing maps:
+library(sf)
+# NOTE: sf requires maptools, rgeos to be loaded
+
+# Random forest fitting and tuning
+library(caret)
+library(ranger)
+library(tuneRanger)
+library(mlr)
+
+# Feature importance
+library(iml)
+
+# For color schemes:
+library(RColorBrewer)
+library(ggsci)
+
+# For graphics layout:
+library(gridExtra)
+library(grid)
+library(gtable)
+
+library(kableExtra)
+
+library(rcompanion)
+```
+
+
+<!--- Read in the management data -->
+```{r MgmtData, eval=TRUE, echo=FALSE}
+load("~/EskerSoybean/ScientificReportsGitHub/Data/Mgmt.RData")
+
+dat <-
+  dat %>%
+  # Drop unused factor levels in state (i.e. SD):
+  dplyr::mutate(state = droplevels(state)) %>%
+  # Rename MG.f to MG:
+  dplyr::rename(MG = MG.f) %>%
+  # Convert yield from bu/acre to kg/ha (1 bushel/acre = 67.25 kg/ha, at 60 lb per bu):
+  # dplyr::mutate(yield = yield*67.25) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(yield = yield*0.06725)
+
+# For modeling drop: order, state, year, TED, longitude
+datII <- dat %>% dplyr::select(-order, -state, -year, -TED, -longitude)
+
+# Set up for mapping:
+states <- sf::st_as_sf(maps::map("state", plot = FALSE, fill = TRUE))
+# Subset to the states of interest:
+soy2 <- states %>%
+  subset(ID %in% c("iowa", "illinois", "indiana", "kansas", "michigan", "minnesota", "nebraska", "north dakota", "south dakota", "ohio", "wisconsin"))
+```
+
+# Summaries
+```{r Summary-Stats, eval=FALSE, echo=FALSE}
+# Proportion of fields treated with foliar fungicides:
+dat %>% dplyr::group_by(foliar.fungicide) %>% dplyr::summarise(n= n())
+# no = 1905, yes = 833 proportion sprayed = 833/2738 = 30.4%
+
+# Proportion of fields treated with both foliar fungicides and insecticides:
+dat %>% dplyr::group_by(foliar.fungicide, foliar.insecticide) %>% dplyr::summarise(n= n())
+
+# Proportion by year:
+dat %>% 
+  dplyr::select(year, foliar.fungicide) %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarise(n = n(), No = sum(foliar.fungicide == "no"), Yes = sum(foliar.fungicide == "yes"), prop.No = No/n, prop.Yes = Yes/n) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate_at(vars(prop.No, prop.Yes), round, digits = 3)
+
+# Proportion by MG:
+dat %>% 
+  dplyr::select(MG, foliar.fungicide) %>%
+  dplyr::group_by(MG) %>%
+  dplyr::summarise(n = n(), No = sum(foliar.fungicide == "no"), Yes = sum(foliar.fungicide == "yes"), prop.No = No/n, prop.Yes = Yes/n) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate_at(vars(prop.No, prop.Yes), round, digits = 3)
+
+
+
+## Estimate the mean yields for the sprayed and unsprayed cohorts of fields within the top 12 TEDs:
+# The top 12 TEDs:
+top.12.TEDs <- dat %>% dplyr::count(TED) %>% dplyr::arrange(-n) %>% dplyr::slice(1:12) %>% dplyr::pull(TED) 
+
+# The number of fields for each of the two cohorts within the TEDs:
+z1 <- 
+dat %>%
+  dplyr::filter(TED %in% top.12.TEDs) %>%
+  dplyr::group_by(TED) %>%
+  dplyr::summarise(n = n(), n.ff = sum(foliar.fungicide == "yes"), n.nff = sum(foliar.fungicide == "no")) %>%
+  dplyr::arrange(desc(n))
+
+# The mean yields for the sprayed cohorts:
+z2 <-
+dat %>%
+  dplyr::filter(TED %in% top.12.TEDs) %>%
+  dplyr::filter(foliar.fungicide == "yes") %>%
+  dplyr::group_by(TED) %>%
+  dplyr::summarise(ff.yld = mean(yield))
+
+# The mean yields for the unsprayed cohorts:
+z3 <- 
+dat %>%
+  dplyr::filter(TED %in% top.12.TEDs) %>%
+  dplyr::filter(foliar.fungicide == "no") %>%
+  dplyr::group_by(TED) %>%
+  dplyr::summarise(nf.yld = mean(yield))
+
+# Now combine the three data frames:
+z <-
+  list(z1, z2, z3) %>%
+  purrr::reduce(dplyr::left_join, by = "TED")
+
+# Sort by the mean yield for the sprayed fields:
+z %>%
+  dplyr::arrange(desc(ff.yld))
+
+# Sort by the mean yield for the unsprayed fields:
+z %>%
+  dplyr::arrange(desc(nf.yld))
+
+# For comparison, the global yield average:
+mean(dat$yield)
+```
+
+
+
+# TEDs
+```{r TEDs, eval=TRUE, echo=FALSE, results='hide'}
+# 96 TEDs
+dat %>% dplyr::count(TED)
+
+# No. of fields in the top 12 TEDs:
+dat %>% dplyr::count(TED) %>% dplyr::arrange(desc(n)) %>% dplyr::slice(1:12) %>% dplyr::tally(n)
+
+# What percent is this out of all fields?
+round(100*(dat %>% dplyr::count(TED) %>% dplyr::arrange(desc(n)) %>% dplyr::slice(1:12) %>% dplyr::tally(n))/nrow(dat), 1)
+```
+
+
+# Field locations {.tabset .tabset-fade .tabset-pills}
+## By MG
+<!-- Supplementary Figure S1 -->
+```{r FieldLocations-MG, eval=TRUE, echo=FALSE}
+# Locations of all the fields facetted by year, field locations colored by maturity group:
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat, aes(x = longitude, y = latitude, colour = MG), size = 1.5, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ year, ncol = 3) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold", size = 10)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1)))
+```
+
+## By PAWR
+```{r FieldLocations-PAWR, eval=TRUE, echo=FALSE}
+# Locations of all the fields facetted by year, field locations colored by PAWR:
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat, aes(x = longitude, y = latitude, colour = PAWR), size = 1.0, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ year, ncol = 3) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "PAWR", override.aes = list(alpha = 1)))
+```
+
+## By GDD
+```{r FieldLocations-GDD, eval=TRUE, echo=FALSE}
+# Locations of all the fields facetted by year, field locations colored by GDD:
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat, aes(x = longitude, y = latitude, colour = GDD), size = 1.0, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ year, ncol = 3) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "GDD", override.aes = list(alpha = 1)))
+```
+
+
+## By AI
+```{r FieldLocations-AI, eval=TRUE, echo=FALSE}
+# Locations of all the fields facetted by year, field locations colored by AI:
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat, aes(x = longitude, y = latitude, colour = AI), size = 1.0, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ year, ncol = 3) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "AI", override.aes = list(alpha = 1)))
+```
+
+
+
+# Random forest model fitting {.tabset .tabset-fade .tabset-pills}
+## Tuning
+```{r RFTuning, eval=FALSE, echo=FALSE}
+# The RF algorithm assumes no missing data; there are no missing data in the data matrix being used.
+
+# Set seed for reproducibility:
+set.seed(14092)
+
+# Create training & testing data sets:
+# Use 0.80 split to avoid warnings about empty factor levels when mlr is creating the task:
+inTraining <- caret::createDataPartition(datII$yield, p = 0.80, list = FALSE)
+training <- datII[inTraining, ]
+testing <- datII[-inTraining, ]
+
+# For tuneRanger, a mlr task has to be created:
+soy.task <- mlr::makeRegrTask(data = as.data.frame(training), target = "yield")
+
+### Ref: Probst et al and the tuneRanger documentation
+# Rough estimation of the tuning time
+# estimateTimeTuneRanger(soy.task)
+
+# Tuning process:
+rf3 <- tuneRanger(soy.task, num.trees = 1500)
+
+# Mean of best 5 % of the results:
+rf3
+# Model with the new tuned hyperparameters:
+rf3$model
+
+# Recommended parameters:
+rf3$recommended.pars
+
+# the OOB RMSE:
+sqrt(rf3$model$learner.model$prediction.error)
+```
+
+
+### Predictions on the test data
+```{r RF-Test-Fit, eval=FALSE, echo=FALSE}
+# Use tuned parameters from tuneRanger:
+fit <- ranger::ranger(yield ~ ., data = training, 
+                      num.trees = 1500, 
+                      mtry = 5, 
+                      importance = "impurity", 
+                      min.node.size = 2, 
+                      replace = FALSE,
+                      sample.fraction =  0.88,
+                      respect.unordered.factors = 'order',
+                      seed = 14092)
+
+
+# The predicted values vs actual values on the test data:
+# The graph below shows the predictions on the test data for the RF model tuned on the training data. There is a tendency to under-predict high yields, and to over-predict the low yields.
+
+data.frame(actual = testing$yield, rngr = predict(fit, data = testing)$predictions, MG = testing$MG) %>%
+  ggplot(., aes(x = actual, y = rngr, colour = MG)) + 
+  geom_point(alpha = 0.5) + 
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  theme_bw() +
+  coord_fixed(xlim = c(0.5, 6), ylim = c(0.5, 6)) +
+  geom_smooth(aes(x = actual, y = rngr), method = lm, inherit.aes = FALSE) +
+  geom_segment(aes(x = 0.5, xend = 6, y = 0.5, yend = 6), size = 1, colour = "black") +
+  ylab("Predicted yield (t/ha)") + 
+  xlab("Actual yield (t/ha)") +
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, hjust = 0.5),
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1)))
+```
+
+
+## Finalized model
+The finalized (tuned) random forest model is refit to the full data using the `ranger` package.
+
+We also use 3,000 trees for stability in the permutation-based variable importance measure (see Probst et al. WIRES article). Permutation-based variable importance is preferred over Gini variable importance measures because the latter is biased. 
+
+```{r RF-Fulldata, eval=TRUE, echo=FALSE}
+# A bit of clean up:
+rm(list = ls()[!(ls() %in% c("dat", "datII", "soy2", "states"))]) 
+
+# Fit a random forest (impurity-based variable importance):
+rfo <- ranger::ranger(yield ~ ., data = datII, 
+                      num.trees = 3000, 
+                      mtry = 5, 
+                      importance = "impurity", 
+                      min.node.size = 2, 
+                      replace = FALSE,
+                      sample.fraction =  0.88,
+                      respect.unordered.factors = 'order',
+                      seed = 14092)
+```
+
+
+
+------------------------------------------------------------------------------------------------
+
+
+# Model interpretations {.tabset .tabset-fade .tabset-pills}
+## Residuals  {.tabset .tabset-fade .tabset-pills}
+
+Residuals = actual - predicted yield  
+
+Scatterplot: The residuals show that yields are being over-predicted (negative residuals) at low yields, and under-predicted (positive residuals) at high yields.
+
+### Version 1
+<!-- Supplementary Figure S2 -->
+```{r ResidualsScatterplotI, eval=TRUE, echo=FALSE, results='hide'}
+predicted <- predict(rfo, data = datII)$predictions
+residuals <- datII$yield - predicted
+
+# RMSE:
+sqrt(sum(residuals^2)/nrow(datII))
+
+# Predicted yield (t/ha) summary statistics:
+round(mean(predicted), digits = 2)
+round(min(predicted), digits = 2)
+round(max(predicted), digits = 2)
+round(sd(predicted)  , digits = 2)
+
+
+# Plotting...
+# options(repr.plot.width = 8, repr.plot.height = 4)
+# Plot residuals vs predicted yield:
+data.frame(predicted = predicted, residuals = residuals, MG = datII$MG) %>%
+ggplot(., aes(x = predicted, y = residuals, colour = MG)) + 
+  geom_point(alpha = 0.5) + 
+  geom_smooth(aes(x = predicted, y = residuals), method = lm, inherit.aes = FALSE) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  theme_bw() +
+  ylab("Residual (t/ha)") + 
+  xlab("Predicted yield (t/ha)") + 
+  theme(axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, hjust = 0.5),
+        axis.title.x = element_text(size = 14, face = "bold"), 
+        axis.title.y = element_text(size = 14, face = "bold")) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1)))
+```
+
+
+### Version 2
+```{r ResidualsScatterplotII, eval=TRUE, echo=FALSE}
+# Another option is to have each MG in its own panel:
+data.frame(predicted = predicted, residuals = residuals, MG = datII$MG) %>%
+ggplot(., aes(x = predicted, y = residuals, colour = MG)) + 
+  geom_point(alpha = 0.5) + 
+  facet_wrap(~ MG) +
+  geom_smooth(aes(x = predicted, y = residuals), method = lm, inherit.aes = FALSE) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  theme_bw() +
+  ylab("Residual (t/ha)") + 
+  xlab("Predicted yield (t/ha)") + 
+  theme(axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10, hjust = 0.5),
+        axis.title.x = element_text(size = 14), 
+        axis.title.y = element_text(size = 14),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  # move the legend into where there was empty facet space
+  theme(legend.position = c(0.9, -0.01), legend.justification = c(1, 0)) +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(title = "Maturity group", override.aes = list(alpha = 1)))
+```
+
+
+
+--------------------------------------------------------------------------------------------------
+
+
+## Global interpretation of machine learning models {.tabset .tabset-fade .tabset-pills}
+Global interpretation is through: 
+
+* variable (feature) importance measures  
+* partial dependence plots 
+* ICE curves
+
+### Feature importance
+```{r iml-setup, eval=TRUE, echo=FALSE}
+# Load iml feature importance and interaction results:
+load("~/EskerSoybean/Manuscripts/TommyPaperAnalysisII/imlResults.RData")
+```
+
+
+<!-- Figure 1 -->
+```{r iml-FeatureImportance-Plot, eval=TRUE, echo=FALSE}
+# Note: to reproduce the plot that is given by plot(iml.imp), I looked into the iml code on GitHub: https://github.com/christophM/iml/tree/master/R
+
+iml.imp.results %>%
+  # Renaming variables for more descriptive labels:
+  dplyr::mutate(feature = replace(feature, feature == "doy", "Sowing date")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "latitude", "Latitude")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "pH.0.30.cm", "Topsoil pH")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "OM.0.30.cm", "Topsoil organic matter")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "seed.rate", "Seeding rate")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "GDD", "Growing degree days")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "foliar.fungicide", "Used a foliar fungicide")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "AI", "Aridity index")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "MG.f", "Soybean maturity group")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "foliar.insecticide", "Used a foliar insecticide")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "texture.0.30", "Topsoil texture")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "TWI", "Topographic wetness index")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "herbicide", "Herbicide program")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "row.space", "Row spacing")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "seed.trt1", "Used a seed treatment")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "starter.fert", "Used a starter fertilizer")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "lime", " Applied lime")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "manure", "Applied manure")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "iron.def", "Iron deficiency symptoms")) %>%
+  dplyr::mutate(feature = replace(feature, feature == "PAWR", "Plant available water holding\ncapacity in the rooting zone")) %>%
+  
+  # want higher importance to appear at the top of the plot:
+  dplyr::arrange(importance) %>%
+  dplyr::mutate(feature = factor(feature, levels = .$feature)) %>%
+  ggplot(., aes(y = feature, x = importance)) +  
+  geom_segment(aes(y = feature, yend = feature, x = importance.05, xend = importance.95), size = 1.5, 
+               color = "darkslategrey") +
+  geom_point(size = 3) +
+  theme_bw() +
+  scale_x_continuous(name = "Feature importance (ratio)", limits = c(1, NA)) + 
+  scale_y_discrete(name = NULL) +
+  theme(axis.title.x = element_text(face = "bold", size = 11)) + 
+  theme(axis.title.y = element_text(face = "bold", size = 11))
+```
+
+### Two-way partial dependence plots {.tabset .tabset-fade .tabset-pills}
+#### doy and latitude
+doy and latitude were the two most important features from the global model perspective
+
+<!-- Supplementary Figure S3 -->
+```{r MPDP-latitude-doy, eval=TRUE, echo=FALSE}
+load("~/EskerSoybean/Manuscripts/TommyPaperAnalysisII/MPDPII.RData")
+
+mpdp.lat.doy %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(yhat = yhat*0.06725) %>%
+  wireframe(yhat ~ latitude*doy, data = .,
+            xlab = "Latitude", ylab = "Sowing date", zlab = "Yield",
+            main = NULL,
+            drape = TRUE,
+            colorkey = TRUE,
+            screen = list(z = -60, x = -60)
+            )
+```
+
+
+#### doy, latitude  and fungicide
+Features with the strongest two-way interactions were latitude, doy and foliar.fungicide. Therefore, we estimated the 2-way pdp for: (i) doy and fungicide, (ii) latitude and fungicide. Then plot the difference in yield between the pdp fungicide curves.
+
+<!-- Figure 2 -->
+```{r iml-PDP-doy-latitude-fungicide, eval=TRUE, echo=FALSE}
+# doy
+p1 <-
+inter.pdp.doy.fungicide.res %>%
+  dplyr::select(doy, foliar.fungicide, .y.hat) %>%
+  dplyr::rename(yld = .y.hat) %>%
+  dplyr::mutate(yld = yld*0.06725) %>%
+  tidyr::spread(., foliar.fungicide, yld) %>%
+  dplyr::mutate(ylddiff = yes - no) %>%
+  ggplot(., aes(x = doy, y = ylddiff)) +
+  geom_line(size = 1) +
+  geom_smooth(method = loess, se = FALSE, span = 0.1) +
+  geom_rug(data = dat, aes(x = doy, y = 0), inherit.aes = FALSE, position = "jitter", sides = "b", 
+           size = 0.1, alpha = 0.3) +
+  ylim(-0.1, 0.4) +
+  theme_bw() +
+  ylab("Yield difference (t/ha) sprayed - unsprayed") + 
+  xlab("Sowing date (day of year)") + 
+  theme(axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10, hjust = 0.5),
+        axis.title.x = element_text(size = 13, face = "bold"), 
+        axis.title.y = element_text(size = 13, face = "bold"))
+
+# latitude
+p2 <-
+inter.pdp.fungicide.latitude.res %>%
+  dplyr::select(latitude, foliar.fungicide, .y.hat) %>%
+  dplyr::rename(yld = .y.hat) %>%
+  # convert to t/ha
+  dplyr::mutate(yld = yld*0.06725) %>%
+  # to be able to calculate the difference in yield between the sprayed and unsprayed curves
+  tidyr::spread(., foliar.fungicide, yld) %>%
+  dplyr::mutate(ylddiff = yes - no) %>%
+  ggplot(., aes(x = latitude, y = ylddiff)) +
+  geom_line(size = 1) +
+  geom_smooth(method = loess, se = FALSE, span = 0.1) +
+  # to add a rug of the data positions:
+  geom_rug(data = dat, aes(x = latitude, y = 0), inherit.aes = FALSE, position = "jitter", sides = "b", 
+           size = 0.1, alpha = 0.3) +
+  ylim(-0.1, 0.4) +
+  # want some more tick mark labels than the default:
+  scale_x_continuous(breaks = seq(37, 51, 2)) +
+  theme_bw() +
+  ylab("Yield difference (t/ha) sprayed - unsprayed") + 
+  xlab("Latitude") + 
+  theme(axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10, hjust = 0.5),
+        axis.title.x = element_text(size = 13, face = "bold"), 
+        axis.title.y = element_text(size = 13, face = "bold"))
+
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+
+
+--------------------------------------------------------------------------------------------------
+
+
+# Top 12 TEDs {.tabset .tabset-fade .tabset-pills}
+## By MG
+<!-- Supplementary Figure S4 -->
+```{r lime-TED-map-top12-by-MG, eval=TRUE, echo=FALSE}
+# Filter to the top 12 TEDs:
+top.12.TEDs <- dat %>% dplyr::count(TED) %>% dplyr::arrange(-n) %>% dplyr::slice(1:12) %>% dplyr::pull(TED) 
+
+# Map the field locations for the top 12 TEDs
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs), 
+             aes(x = longitude, y = latitude, colour = MG), alpha = 0.5, size = 1.5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 13),
+        axis.text.x  = element_text(size = 9, angle = 90),
+        axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  guides(colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical")
+```
+
+## By PAWR 
+```{r lime-TED-map-top12-by-PAWR, eval=TRUE, echo=FALSE}
+# Map the field locations for the top 12 TEDs
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs), 
+             aes(x = longitude, y = latitude, colour = PAWR), alpha = 0.5, size = 1.0) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  guides(colour = guide_legend(nrow = 1, title = "PAWR", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical")
+```
+
+## By GDD
+```{r lime-TED-map-top12-by-GDD, eval=TRUE, echo=FALSE}
+# Map the field locations for the top 12 TEDs
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs), 
+             aes(x = longitude, y = latitude, colour = GDD), alpha = 0.5, size = 1.0) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  guides(colour = guide_legend(nrow = 1, title = "GDD", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical")
+```
+
+## By AI
+```{r lime-TED-map-top12-by-AI, eval=TRUE, echo=FALSE}
+# Map the field locations for the top 12 TEDs
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% 
+               dplyr::filter(TED %in% top.12.TEDs), 
+             aes(x = longitude, y = latitude, colour = AI), alpha = 0.5, size = 1.0) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold")) +
+  guides(colour = guide_legend(nrow = 1, title = "AI", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical")
+```
+
+
+
+
+# Shapley
+```{r Shapley-Load-FittedObjects, eval=TRUE, echo=FALSE}
+load("~/EskerSoybean/Manuscripts/TommyPaperAnalysisII/ShapFits.RData")
+```
+
+## HYF vs HYNF {.tabset .tabset-fade .tabset-pills}
+### Figure
+<!-- Figure 3 -->
+```{r shap-Comparisons-Top12-HYF-HYNF, eval=TRUE, echo=FALSE}
+# Now you want to generalize for any TED, iterating over the sample_id in the TED, for any one of HYF, HYNF, LYF, LYNF:
+fx <- function(.dat, .TED) {
+  # for any one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap, iterate over sample_id in a TED and get the yield difference and phi values along with other information for plotting
+  # Args:
+  #  .dat = one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap
+  #  .TED = a TED in one of the .shap files
+  # Returns:
+  #  a data frame of extracted phi and other components for each field
+  #
+  # Number of sample_id (fields) in a given TED:
+  sl <- purrr::pluck(.dat, .TED, "sample_id") %>% length()
+  
+  # Iterate over all the sample_id in the TED:
+  purrr::map_df(1:sl, function(.i) {
+    purrr::pluck(.dat, .TED) %>% 
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(TED = .TED) %>%
+      dplyr::select(sample_id, TED, ylddiff, phi, fung)
+  }
+  )
+}  # end fx
+
+
+# Example of use:
+# fx(.dat = HYNF.shap, .TED = "303603")
+
+# Now apply fx over all the TEDs, for HYF and HYNF and bind into a data.frame:
+HY <-
+  dplyr::bind_rows(
+  purrr::map_df(HYF.shap %>% names(), fx, .dat = HYF.shap),
+  purrr::map_df(HYNF.shap %>% names(), fx, .dat = HYNF.shap)) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("303603", "303703", "403603", "403703", "504803", "602303", "603503", "603603", "603703", "604503", "604603", "604803"))) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("no", "yes"), labels = c("Unsprayed", "Sprayed")))
+
+# and now plot...
+HY %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = fung)) +
+  geom_point(alpha = 0.5, size = 2.0) +
+  # Based on RColorbrewer qualitative set 1:
+  scale_color_manual(values = c("#377eb8", "#ff7f00")) + 
+  theme_bw() +
+  # geom_hline(yintercept = 0, linetype = 2) +
+  geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+  geom_vline(aes(xintercept = 0), color = "gray70", size = 0.6) +
+  facet_wrap(~ TED) +
+  # ylab("phi value (t/ha)") +
+  ylab(expression(bolditalic("phi")~bold(" value (t/ha)"))) +
+  xlab("Single field predicted yield - mean predicted yield (t/ha)") +
+  theme(axis.title.x = element_text(face = "bold", size = 13),
+        axis.text.x  = element_text(size = 10, angle = 0),
+        # axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+        axis.title.y = element_text(size = 13, angle = 90),
+        axis.text.y  = element_text(size = 10),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold", size = 10)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  # override the transparency of the points for the legend:
+  guides(colour = guide_legend(nrow = 1, title = "Foliar fungicide", override.aes = list(alpha = 1)))
+```
+
+### Summary as a Table
+```{r shap-Comparisons-Top12-HYF-HYNF-Table, eval=TRUE, echo=FALSE}
+# GOAL: Summary of the predicted yields, phi values, for each TED and cohort (sprayed, unsprayed) within TED
+
+# Define a helper function to extract the relevant parts from the .shap objects
+fx1 <- function(.dat, .TED) {
+  # for any one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap, iterate over sample_id in a TED and get the predicted yield and phi values per field
+  # Args:
+  #  .dat = one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap
+  #  .TED = a TED in one of the .shap files
+  # Returns:
+  #  a data frame of extracted predicted yield, phi and other components for each field
+  #
+  # Number of sample_id (fields) in a given TED:
+  sl <- purrr::pluck(.dat, .TED, "sample_id") %>% length()
+  
+  # Iterate over all the sample_id in the TED:
+  purrr::map_df(1:sl, function(.i) {
+    purrr::pluck(.dat, .TED) %>% 
+      dplyr::slice(.i) %>% 
+      # Get the predicted yield:
+      dplyr::mutate(pred = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      # Get the phi values associated with foliar fungicide:
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(TED = .TED) %>%
+      dplyr::select(sample_id, TED, pred, phi, fung)
+  }
+  )
+}  # end fx1
+
+# Now apply fx1 over all the TEDs, for HYF and HYNF and bind into a data.frame:
+HYdat <-
+  dplyr::bind_rows(
+  purrr::map_df(HYF.shap %>% names(), fx1, .dat = HYF.shap),
+  purrr::map_df(HYNF.shap %>% names(), fx1, .dat = HYNF.shap)) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("303603", "303703", "403603", "403703", "504803", "602303", "603503", "603603", "603703", "604503", "604603", "604803"))) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("no", "yes"), labels = c("Unsprayed", "Sprayed"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(pred = pred*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725)
+
+# Output the Table:
+HYdat %>%
+  dplyr::group_by(TED, fung) %>%
+  dplyr::summarise_at(c("pred", "phi"), list(~min(.), ~max(.), ~mean(.))) %>%
+  dplyr::select(TED, fung, starts_with("pred"), starts_with("phi")) %>%
+  knitr::kable(., row.names = FALSE, digits = 3, align = "llcccccc", col.names = c("TED", "Fungicide", "Min", "Max", "Mean", "Min", "Max", "Mean")) %>%
+  kableExtra::kable_styling("striped") %>%
+  kableExtra::add_header_above(c(" " = 2, "Predicted Yield (t/ha)" = 3, "Phi (t/ha)" = 3))
+
+# The overall means among the sprayed and unsprayed fields across all 12 TEDs:
+HYdat %>%
+  dplyr::group_by(fung) %>%
+  dplyr::summarise(ave.pred = mean(pred), ave.phi = mean(phi))
+```
+
+
+### Summary of the $\phi$ values
+<!-- Supplementary Figure S5 -->
+```{r shap-Comparisons-Top12-HYF-HYNF-Figure, eval=TRUE, echo=FALSE, fig.keep='last'}
+# str(HYdat)
+
+# Field order (sprayed, by phi):
+ted.order <- 
+  HYdat %>%
+  dplyr::filter(fung == "Sprayed") %>%
+  dplyr::group_by(TED) %>%
+  dplyr::summarise(ave = mean(phi)) %>%
+  # want higher mean yield to appear at the bottom of the plot:
+  dplyr::arrange(desc(ave)) %>%
+  dplyr::pull(TED) %>%
+  as.character()
+
+# GOAL: plot the mean predicted yield per TED, with TEDs sorted by ted.order, jitter for the yields of the individual fields within TEDs:
+HYdat %>%
+  dplyr::filter(fung == "Sprayed") %>%
+  dplyr::mutate(TED = factor(TED, levels = ted.order)) %>%
+  ggplot(., aes(x = TED, y = pred, colour = TED)) +
+  coord_flip() +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  scale_color_viridis_d(option = "D") +
+  labs(x = "TED", y = "Predicted yield (t/ha)") +
+  theme_bw() +
+  ggtitle("A") +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.text.x  = element_text(size = 9, angle = 0),
+    axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 9),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold")
+    )
+
+
+# Generalize to a function:
+fxn <- function(.df, .fung, .var, .ylab, my.title, LL, UL) {
+  #
+  # Args:
+  #  .df = data frame with the TEDs, foliar fungicide, predicted yield, phi for fungicide
+  #  .fung = character string for fungicide ("Sprayed", "Unsprayed")
+  #  .var = unquoted string for predicted yield (pred) or phi (phi)
+  #  .ylab = character string for the y-axis label
+  #  my.title = character string for the plot title
+  #  LL = 
+  #  UL =
+  #
+  # Returns:
+  #  plot of the predicted yield or phi for fungicide for individual fields in each TED, plus the mean
+  #
+  var <- enquo(.var)
+  
+  # the overall mean across all TEDs:
+  smry <- .df %>%
+    dplyr::filter(fung == .fung) %>%
+    dplyr::select(!!var) %>%
+    dplyr::summarise(mn = mean(!!var)) %>%
+    dplyr::pull(mn)
+    
+  
+  .df %>%
+  dplyr::filter(fung == .fung) %>%
+  dplyr::mutate(TED = factor(TED, levels = ted.order)) %>%
+  ggplot(., aes(x = TED, y = !!var, colour = TED)) +
+  coord_flip() +
+  # line representing the overall mean:
+  geom_hline(aes(yintercept = smry), color = "gray70", size = 0.6) +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  scale_color_viridis_d(option = "D") +
+  scale_y_continuous(limits = c(LL, UL), expand = c(0.005, 0.005)) +
+  labs(x = NULL, y = .ylab) +
+  theme_bw() +
+  ggtitle(my.title) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.text.x  = element_text(size = 9, angle = 0),
+    axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 9),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold")
+    )
+} # end function
+
+
+# h1 <- fxn(.df = HYdat, .fung = "Sprayed", .var = pred, .ylab = "Predicted yield (t/ha)", my.title = "Sprayed", LL = 1.5, UL = 7.0)  
+# h2 <- fxn(.df = HYdat, .fung = "Unsprayed", .var = pred, .ylab = "Predicted yield (t/ha)", my.title = "Unsprayed", LL = 1.5, UL = 7.0)  
+# h3 <- fxn(.df = HYdat, .fung = "Sprayed", .var = phi, .ylab = "Phi (t/ha)", my.title = "Sprayed", LL = -0.15, UL = 0.4)
+# h4 <- fxn(.df = HYdat, .fung = "Unsprayed", .var = phi, .ylab = "Phi (t/ha)", my.title = "Unsprayed", LL = -0.15, UL = 0.4)  
+# 
+# grid.arrange(h1, h3, h2, h4, ncol = 2)
+
+h1 <- fxn(.df = HYdat, .fung = "Sprayed", .var = pred, .ylab = "Predicted yield (t/ha)", my.title = "Sprayed", LL = 1.5, UL = 7.0)  
+h2 <- fxn(.df = HYdat, .fung = "Unsprayed", .var = pred, .ylab = "Predicted yield (t/ha)", my.title = "Unsprayed", LL = 1.5, UL = 7.0)  
+h3 <- fxn(.df = HYdat, .fung = "Sprayed", .var = phi, .ylab = expression(bolditalic("phi")~bold(" (t/ha)")), my.title = "Sprayed", LL = -0.15, UL = 0.4)
+h4 <- fxn(.df = HYdat, .fung = "Unsprayed", .var = phi, .ylab = expression(bolditalic("phi")~bold(" (t/ha)")), my.title = "Unsprayed", LL = -0.15, UL = 0.4)  
+
+grid.arrange(h1, h3, h2, h4, ncol = 2)
+```
+
+
+
+
+## AllHYF.shap, AllHYNF.shap, AllLYF.shap, AllLYNF.shap {.tabset .tabset-fade .tabset-pills}
+### Main Figure
+
+```{r shap-Comparisons-All-TableInsert, eval=TRUE, echo=FALSE}
+## Code for an Insert table
+
+# No. fields, min, max and mean predicted yields by cohort (sprayed x yield category)
+
+# Define a helper function:
+fxb <- function(.dat, .yldenv) {
+  
+  # Extract the predicted yields from one of the Allxx.shap objects.
+  # Args:
+  #  .dat = one of AllHYF.shap, AllHYNF.shap, AllLYF.shap, AllLYNF.shap
+  #  .yldenv = character string for best- or worst-yielding fields ("Low", "High")
+  # Returns:
+  #  a data frame of the extracted values
+  #
+  # Iterate over all the sample_id (there are 100 fields in each of the `All` groups:
+  purrr::map_df(1:100, function(.i) {
+      .dat %>%
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(yldenv = .yldenv) %>%
+      dplyr::select(sample_id, actual, fung, yldenv)
+  }
+  )
+}  # end fxb
+
+# Prep the data:
+d.tab <- 
+  dplyr::bind_rows(fxb(.dat = AllHYF.shap, .yldenv = "Highest yielding"),
+                   fxb(.dat = AllHYNF.shap, .yldenv = "Highest yielding"),
+                   fxb(.dat = AllLYF.shap, .yldenv = "Lowest yielding"),
+                   fxb(.dat = AllLYNF.shap, .yldenv = "Lowest yielding")) %>%
+  dplyr::mutate(yldenv = factor(yldenv, levels = c("Lowest yielding", "Highest yielding"))) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("no", "yes"), labels = c("Unsprayed", "Sprayed"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(actual = actual*0.06725) %>%
+  dplyr::group_by(fung, yldenv) %>%
+  dplyr::summarise(`No. fields` = n(), `Min Yield` = min(actual), `Max Yield` = max(actual), `Mean Yield` = mean(actual)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(`Min Yield` = sprintf("%.1f", `Min Yield`),
+                `Max Yield` = sprintf("%.1f", `Max Yield`),
+                `Mean Yield` = sprintf("%.1f", `Mean Yield`)) %>%
+  dplyr::rename(Fungicide = fung, Cohort = yldenv)
+```
+
+
+<!-- Figure 4 -->
+```{r shap-Comparisons-All-Figure, eval=TRUE, echo=FALSE}
+# Define a helper function:
+fxa <- function(.dat, .yldenv) {
+  # Extract the phi values from one of the Allxx.shap objects.
+  # Args:
+  #  .dat = one of AllHYF.shap, AllHYNF.shap, AllLYF.shap, AllLYNF.shap
+  #  .yldenv = character string for best- or worst-yielding fields ("Low", "High")
+  # Returns:
+  #  a data frame of the extracted values
+  #
+  # Iterate over all the sample_id (there are 100 fields in each of the `All` groups:
+  purrr::map_df(1:100, function(.i) {
+      .dat %>%
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(yldenv = .yldenv) %>%
+      dplyr::select(sample_id, ylddiff, phi, fung, yldenv)
+  }
+  )
+}  # end fxa
+
+# Prep the data:
+alldf <- 
+dplyr::bind_rows(fxa(.dat = AllHYF.shap, .yldenv = "Highest yielding"),
+                 fxa(.dat = AllHYNF.shap, .yldenv = "Highest yielding"),
+                 fxa(.dat = AllLYF.shap, .yldenv = "Lowest yielding"),
+                 fxa(.dat = AllLYNF.shap, .yldenv = "Lowest yielding")) %>%
+  dplyr::mutate(yldenv = factor(yldenv, levels = c("Lowest yielding", "Highest yielding"))) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("no", "yes"), labels = c("Unsprayed", "Sprayed"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725)
+  
+
+# Now plot:
+alldf %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = fung, shape = yldenv)) +
+  geom_point(alpha = 0.5, size = 2.0) +
+  # Based on RColorbrewer qualitative set 1:
+  scale_color_manual(values = c("#377eb8", "#ff7f00")) + 
+  # Don't use the same point symbols for foliar fungicide (circles) and yldenv:
+  scale_shape_manual(values = c(15 ,17)) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  # ylab("Phi value (t/ha)") +
+  ylab(expression(bolditalic("phi")~bold(" value (t/ha)"))) +
+  xlab("Single field predicted yield - mean predicted yield (t/ha)") +
+  theme(axis.title.x = element_text(face = "bold", size = 13),
+        axis.text.x  = element_text(size = 11, angle = 0),
+        # axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+        axis.title.y = element_text(size = 13, angle = 90),
+        axis.text.y  = element_text(size = 11)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  # override the transparency of the points for the legend:
+  guides(shape = guide_legend(nrow = 1, title = "Field", override.aes = list(alpha = 1)), 
+         colour = guide_legend(nrow = 1, title = "Foliar fungicide", override.aes = list(alpha = 1))) +
+  # Use the rowhead argument to set the labels to non-italic bold:
+  # rows = NULL prevents row numbers from being printed with the Table:
+  annotation_custom(gridExtra::tableGrob(d.tab, rows = NULL, theme = ttheme_default(base_size = 8, rowhead = list(fg_params = list(col = "black", fontface = 2L)))), xmin = -2.1, xmax = 0, ymin = 0.2, ymax = 0.45)
+```
+
+
+### Histogram of the $\phi$ values
+```{r shap-Comparisons-All-Histo, eval=TRUE, echo=FALSE}
+alldf %>%
+  ggplot(., aes(x = phi)) +
+  geom_histogram(binwidth = .01, fill = "grey90", colour = "black") +
+  facet_grid(yldenv ~ fung) +
+  theme_bw() +
+  geom_vline(xintercept = 0, colour = "grey50", linetype = "dashed") +
+  xlab("Phi value (t/ha)") +
+  ylab("No. fields") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6))
+```
+
+
+### Tabular summary of the $\phi$ values
+```{r shap-Comparisons-All-Summary-Table, eval=TRUE, echo=FALSE}
+alldf %>%
+  dplyr::group_by(yldenv, fung) %>%
+  dplyr::summarise(mean = mean(phi), min = min(phi), max = max(phi))
+```
+
+### Plot summary of the $\phi$ values
+<!-- Supplementary Figure S6 -->
+```{r shap-Comparisons-All-Summary-Fig, eval=TRUE, echo=FALSE}
+# str(alldf)
+
+alldf %>%
+  # Create labels:
+  dplyr::mutate(lbs = "N.A.") %>%
+  dplyr::mutate(lbs = replace(lbs, fung == "Sprayed" & yldenv == "Highest yielding", "Sprayed (HY)")) %>%
+  dplyr::mutate(lbs = replace(lbs, fung == "Sprayed" & yldenv == "Lowest yielding", "Sprayed (LY)")) %>%
+  dplyr::mutate(lbs = replace(lbs, fung == "Unsprayed" & yldenv == "Highest yielding", "Unsprayed (HY)")) %>%
+  dplyr::mutate(lbs = replace(lbs, fung == "Unsprayed" & yldenv == "Lowest yielding", "Unsprayed (LY)")) %>%
+  dplyr::mutate(lbs = factor(lbs, levels = c("Unsprayed (LY)", "Unsprayed (HY)", "Sprayed (LY)", "Sprayed (HY)"))) %>%
+  ggplot(., aes(x = lbs, y = phi, colour = fung, shape = yldenv)) +
+  coord_flip() +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  # Based on RColorbrewer qualitative set 1:
+  scale_color_manual(values = c("#377eb8", "#ff7f00")) + 
+  # labs(x = NULL, y = "Phi value (t/ha)") +
+  labs(x = NULL, y = expression(bolditalic("phi")~bold(" value (t/ha)"))) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 13),
+    axis.text.x  = element_text(size = 10, angle = 0),
+    axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 10),
+    panel.grid = element_blank()
+    )
+```
+
+
+
+## HQF and HQNF {.tabset .tabset-fade .tabset-pills}
+### By MG {.tabset .tabset-fade .tabset-pills}
+#### Main figure
+```{r shap-phiyld-HQ-MG, eval=TRUE, echo=FALSE}
+# Prepare the insert table:
+d <- 
+  dplyr::bind_rows(
+    HQNF.shap %>%  
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(actual = actual*0.06725) %>%
+      # Using descriptive names, so hence the quotes:
+      dplyr::summarise(`No. fields` = n(), `Min Yield` = min(actual), `Max Yield` = max(actual), 
+                       `Mean Yield` = mean(actual)) %>%
+      dplyr::ungroup() %>%
+      # Restrict display to 1 decimal place:
+      dplyr::mutate(`Min Yield` = sprintf("%.1f", `Min Yield`),
+                    `Max Yield` = sprintf("%.1f", `Max Yield`),
+                    `Mean Yield` = sprintf("%.1f", `Mean Yield`)) %>%
+      dplyr::mutate(fungicide = "Unsprayed") %>%
+      dplyr::select(fungicide, everything()),
+    
+    HQF.shap %>%  
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(actual = actual*0.06725) %>%
+      dplyr::summarise(`No. fields` = n(), `Min Yield` = min(actual), `Max Yield` = max(actual), 
+                       `Mean Yield` = mean(actual)) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(`Min Yield` = sprintf("%.1f", `Min Yield`),
+                    `Max Yield` = sprintf("%.1f", `Max Yield`),
+                    `Mean Yield` = sprintf("%.1f", `Mean Yield`)) %>%
+      dplyr::mutate(fungicide = "Sprayed") %>%
+      dplyr::select(fungicide, everything())
+    ) %>% 
+  # I want the rows labelled by fungicide use:
+  tibble::column_to_rownames(var = "fungicide")
+  
+
+## All HQ fields, plot points by MG and fungicide
+dplyr::bind_rows(
+HQF.shap %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+    dplyr::filter(feature == "foliar.fungicide") %>%
+    dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, ylddiff:MG)
+,
+HQNF.shap %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, ylddiff:MG)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG, shape = fung)) +
+  geom_point(size = 2.0, alpha = 0.8) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab("Phi value (t/ha)") +
+  xlab("Single field predicted yield - mean predicted yield (t/ha)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 10, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  # override the transparency of the points for the legend:
+  guides(shape = guide_legend(nrow = 1, title = "Fungicide", override.aes = list(alpha = 1)), 
+         colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1))) +
+  # Use the rowhead argument to set the labels to non-italic bold:
+  annotation_custom(gridExtra::tableGrob(d, 
+                              theme = ttheme_default(base_size = 7,
+                                                     rowhead = list(fg_params = list(col = "black", fontface = 2L)))), 
+                    xmin = -0.2, xmax = 1.1, ymin = 0.3, ymax = 0.45)
+```
+
+#### Summary of the $\phi$ values
+```{r shap-phiyld-HQ-MG-smry, eval=TRUE, echo=FALSE}
+# GOAL: two-panel figure (sprayed and unsprayed). Each panel plots phi on x axis, MG on y axis. 
+# Points: individual phi for each field, and large dot for the overall mean per MG.
+
+# Extract the phi values and MG from the .shap objects:
+d.phi <- 
+  dplyr::bind_rows(
+  HQF.shap %>% 
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+    dplyr::filter(feature == "foliar.fungicide") %>%
+    dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, MG, phi)
+,
+HQNF.shap %>% 
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, MG, phi)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(phi = phi*0.06725) 
+
+# Check the limits on phi:
+# d.phi %>%
+#   dplyr::group_by(fung) %>%
+#   dplyr::summarise(min.phi = min(phi), max.phi = max(phi))
+
+
+fxn2 <- function(.df, .fung, .ylab, my.title, LL, UL) {
+  # Plot the mean phi per MG, jitter for the phi of the individual fields within MG:
+  #
+  # Args:
+  #  .df = data frame with MG, foliar fungicide, phi for fungicide
+  #  .fung = character string for fungicide ("Sprayed", "Unsprayed")
+  #  .ylab = character string for the y-axis label
+  #  my.title = character string for the plot title
+  #  LL = lower limit for the phi axis
+  #  UL = upper limit for the phi axis
+  #
+  # Returns:
+  #  plot of the predicted yield or phi for fungicide for individual fields in each TED, plus the mean
+  #
+  smry <- .df %>%
+    dplyr::filter(fung == .fung) %>%
+    dplyr::select(phi) %>%
+    dplyr::summarise(mn = mean(phi)) %>%
+    dplyr::pull(mn)
+    
+  
+  .df %>%
+  dplyr::filter(fung == .fung) %>%
+  ggplot(., aes(x = MG, y = phi, colour = MG)) +
+  coord_flip() +
+  geom_hline(aes(yintercept = smry), color = "gray70", size = 0.6) +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  scale_y_continuous(limits = c(LL, UL), expand = c(0.005, 0.005)) +
+  labs(x = NULL, y = .ylab) +
+  theme_bw() +
+  ggtitle(my.title) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.text.x  = element_text(size = 9, angle = 0),
+    axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 9),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold")
+    )
+} # end function fxn2
+
+
+h1 <- fxn2(.df = d.phi, .fung = "Sprayed", .ylab = "Phi (t/ha)", my.title = "Sprayed", LL = -0.1, UL = 0.5)  
+h2 <- fxn2(.df = d.phi, .fung = "Unsprayed", .ylab = "Phi (t/ha)", my.title = "Unsprayed", LL = -0.1, UL = 0.5)  
+
+grid.arrange(h1, h2, ncol = 1)
+```
+
+```{r shap-phiyld-HQ-MG-checks, eval=FALSE, echo=FALSE}
+# Check the limits on phi:
+d.phi %>%
+  dplyr::group_by(fung) %>%
+  dplyr::summarise(min.phi = min(phi), max.phi = max(phi), mean.phi = mean(phi))
+```
+
+
+
+### By doy
+```{r shap-phiyld-HQ-doy, eval=TRUE, echo=FALSE}
+dplyr::bind_rows(
+  HQF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(fung = "Y") %>%
+    dplyr::select(fung, ylddiff:doy)
+  ,
+  HQNF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(fung = "N") %>%
+    dplyr::select(fung, ylddiff:doy)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy, shape = fung)) +
+  geom_point(size = 2.0, alpha = 1.0) +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab("Phi value (t/ha)") +
+  xlab("Single field predicted yield - mean predicted yield (t/ha)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 10, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Sowing date", shape = "Fungicide")
+```
+
+
+### By GDD
+```{r shap-phiyld-HQ-GDD, eval=TRUE, echo=FALSE}
+dplyr::bind_rows(
+  HQF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(fung = "Y") %>%
+    dplyr::select(fung, ylddiff:GDD)
+  ,
+  HQNF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(fung = "N") %>%
+    dplyr::select(fung, ylddiff:GDD)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD, shape = fung)) +
+  geom_point(size = 2) +
+  # scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  ggsci::scale_color_uchicago(palette = "dark", drop = FALSE, alpha = 0.8) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab("Phi value (t/ha)") +
+  xlab("Single field predicted yield - mean predicted yield (t/ha)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 10, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  # override the transparency of the points for the legend:
+  guides(shape = guide_legend(nrow = 1, title = "Fungicide", override.aes = list(alpha = 1)), 
+         colour = guide_legend(nrow = 1, title = "GDD", override.aes = list(alpha = 1)))
+```
+
+
+### Composite plot {.tabset .tabset-fade .tabset-pills}
+#### Original
+```{r ThreeFigCompositeVer1, eval=TRUE, echo=FALSE}
+# Prepare the insert table:
+d <- 
+  dplyr::bind_rows(
+    HQNF.shap %>%  
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(actual = actual*0.06725) %>%
+      # Using descriptive names, so hence the quotes:
+      dplyr::summarise(`No. fields` = n(), `Min Yield` = min(actual), `Max Yield` = max(actual), 
+                       `Mean Yield` = mean(actual)) %>%
+      dplyr::ungroup() %>%
+      # Restrict display to 1 decimal place:
+      dplyr::mutate(`Min Yield` = sprintf("%.1f", `Min Yield`),
+                    `Max Yield` = sprintf("%.1f", `Max Yield`),
+                    `Mean Yield` = sprintf("%.1f", `Mean Yield`)) %>%
+      dplyr::mutate(fungicide = "Unsprayed") %>%
+      dplyr::select(fungicide, everything()),
+    
+    HQF.shap %>%  
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(actual = actual*0.06725) %>%
+      dplyr::summarise(`No. fields` = n(), `Min Yield` = min(actual), `Max Yield` = max(actual), 
+                       `Mean Yield` = mean(actual)) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(`Min Yield` = sprintf("%.1f", `Min Yield`),
+                    `Max Yield` = sprintf("%.1f", `Max Yield`),
+                    `Mean Yield` = sprintf("%.1f", `Mean Yield`)) %>%
+      dplyr::mutate(fungicide = "Sprayed") %>%
+      dplyr::select(fungicide, everything())
+    ) %>% 
+  # I want the rows labelled by fungicide use:
+  tibble::column_to_rownames(var = "fungicide")
+
+## Yield summary table:
+# Use the rowhead argument to set the labels to non-italic bold:
+t1 <- gridExtra::tableGrob(d, theme = ttheme_default(base_size = 9, rowhead = list(fg_params = list(col = "black", 
+                                                                                              fontface = 2L))))
+  
+  
+## By MG: All HQ fields, plot points by MG and fungicide
+p1dat <-
+  dplyr::bind_rows(
+  HQF.shap %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+    dplyr::filter(feature == "foliar.fungicide") %>%
+    dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, ylddiff:MG)
+,
+HQNF.shap %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, ylddiff:MG)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) 
+
+# ORIGINAL:
+p1 <-
+  p1dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG, shape = fung)) +
+  geom_point(size = 2.0, alpha = 0.8) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(shape = FALSE,
+         colour = guide_legend(nrow = 1, title = "Maturity group", override.aes = list(alpha = 1))) +
+  ggtitle("a") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+
+## By doy
+p2dat <- 
+  dplyr::bind_rows(
+  HQF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(fung = "Y") %>%
+    dplyr::select(fung, ylddiff:doy)
+  ,
+  HQNF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(fung = "N") %>%
+    dplyr::select(fung, ylddiff:doy)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) 
+
+# ORIGINAL p2:
+p2 <-
+  p2dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy, shape = fung)) +
+  geom_point(size = 2.0, alpha = 1.0) +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Sowing date", shape = "Fungicide") +
+  ggtitle("b") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+
+## By GDD
+p3dat <-
+  dplyr::bind_rows(
+  HQF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(fung = "Y") %>%
+    dplyr::select(fung, ylddiff:GDD)
+  ,
+  HQNF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(fung = "N") %>%
+    dplyr::select(fung, ylddiff:GDD)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(ylddiff = ylddiff*0.06725) %>%
+  dplyr::mutate(phi = phi*0.06725) 
+
+
+# ORIGINAL:
+p3 <-
+  p3dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD, shape = fung)) +
+  geom_point(size = 2) +
+  # scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  ggsci::scale_color_uchicago(palette = "dark", drop = FALSE, alpha = 0.8) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(shape = FALSE,
+         colour = guide_legend(nrow = 1, title = "GDD", override.aes = list(alpha = 1))) +
+  ggtitle("c") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+
+
+# This was my original layout:
+grid.arrange(p1, p2, p3, t1, ncol = 2,
+             bottom = grid::textGrob("Single field predicted yield - mean predicted yield (t/ha)", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12)),
+             left = grid::textGrob("Phi value (t/ha)", 
+                                   gp = grid::gpar(fontface = "bold", fontsize = 12), rot = 90)
+             )
+```
+
+
+#### Revised
+<!-- Figure 5 -->
+```{r ThreeFigCompositeVer2, eval=TRUE, echo=FALSE}
+## p1 revised so that legend is on the right:
+p1.r <-
+  p1dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG, shape = fung)) +
+  geom_point(size = 2.0, alpha = 0.8) +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(shape = FALSE, 
+         colour = guide_legend(title = "Maturity\ngroup", override.aes = list(alpha = 1))) +
+  ggtitle("a") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+### REVISION: want the continuous scale for doy, no legend for fungicide
+# See this for ideas: https://stackoverflow.com/questions/44168996/how-to-create-a-continuous-legend-color-bar-style-for-scale-alpha
+# But the key here was to remember that plotting is in layers, so can remove the fungicide legend last.
+p2.r <-
+  p2dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy, shape = fung)) +
+  geom_point(size = 2.0) +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Sowing\ndate") +
+  guides(shape = FALSE) +
+  ggtitle("b") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+# REVISED: legend is placed on the right:
+p3.r <-
+  p3dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD, shape = fung)) +
+  geom_point(size = 2) +
+  # scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  ggsci::scale_color_uchicago(palette = "dark", drop = FALSE, alpha = 0.8) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 2.5) +
+  ylab(NULL) +
+  xlab(NULL) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0),
+        axis.text.y  = element_text(size = 10)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(shape = FALSE, 
+         colour = guide_legend(title = "GDD", override.aes = list(alpha = 1))) +
+  ggtitle("c") +
+  theme(plot.title = element_text(face = "bold", size = 12))
+
+## Draw a plot with the fungicide (shape) legend:
+p4 <-
+  p3dat %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD, shape = fung)) +
+  geom_point(size = 2) +
+  ggsci::scale_color_uchicago(palette = "dark", drop = FALSE, alpha = 0.8) +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = FALSE, 
+         shape = guide_legend(nrow = 1, title = "Fungicide", override.aes = list(alpha = 1)))
+
+## Extract the shape legend:
+leg1 <- gtable::gtable_filter(ggplot_gtable(ggplot_build(p4)), "guide-box") 
+
+gs <- list(p1.r, p2.r, p3.r, leg1, t1) 
+# Had to play around with the layout so that there was not too much empty space between the fungicide legend and the data table:
+lay <- rbind(c(1, 2),
+             c(1, 2),
+             c(1, 2),
+             c(3, 4),
+             c(3, 5),
+             c(3, NA))
+
+# grid.arrange(grobs = gs, layout_matrix = lay,
+#              bottom = grid::textGrob("Single field predicted yield - mean predicted yield (t/ha)", 
+#                                      gp = grid::gpar(fontface = "bold", fontsize = 12)),
+#              left = grid::textGrob("Phi value (t/ha)", 
+#                                    gp = grid::gpar(fontface = "bold", fontsize = 12), rot = 90))
+
+
+grid.arrange(grobs = gs, layout_matrix = lay,
+             bottom = grid::textGrob("Single field predicted yield - mean predicted yield (t/ha)", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12)),
+             left = grid::textGrob(expression(bolditalic("phi")~bold(" value (t/ha)")), 
+                                   gp = grid::gpar(fontface = "bold", fontsize = 12), rot = 90))
+```
+
+
+
+# Economic analysis {.tabset .tabset-fade .tabset-pills}
+* Fungicide applied to field
+* Fix chemical and application costs ($61.90/ha)
+* Specify soybean price received
+
+
+## HYF in top 12 TEDs {.tabset .tabset-fade .tabset-pills}
+### Single price point I {.tabset .tabset-fade .tabset-pills}
+#### Figure
+```{r Econ-Top12-Single-I-Fig, eval=TRUE, echo=FALSE}
+fx <- function(.dat, .TED) {
+  # for any one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap, iterate over sample_id in a TED and get the yield difference and phi values along with other information for plotting
+  # Args:
+  #  .dat = one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap
+  #  .TED = a TED in one of the .shap files
+  # Returns:
+  #  a data frame of extracted phi and other components for each field
+  #
+  # Number of sample_id (fields) in a given TED:
+  sl <- purrr::pluck(.dat, .TED, "sample_id") %>% length()
+  
+  # Iterate over all the sample_id in the TED:
+  purrr::map_df(1:sl, function(.i) {
+    purrr::pluck(.dat, .TED) %>% 
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(TED = .TED) %>%
+      dplyr::select(sample_id, TED, ylddiff, phi, fung)
+  }
+  )
+}  # end fx
+
+# Price = $350/t: this is on the low end of soybean prices
+# Mean = $420/t
+# High = $530/t
+
+# NOTE: 1/26/2021: originally had done the graphic with price = $350/t, the low end. But thought it would be more realistic to do with the mean, so was redone with price = $420/t.
+
+# Revised to reflect the price of 576.30 as of Jan 31 2021
+# chem.cost comes from Kandel et al. (2016). Plant Health Progress. Based on statistics compiled for the corn fungicides project, chemical costs tend to be rather flat over time. 
+
+soy.price <- 576.30
+chem.cost <- 61.90
+
+HY <-
+  purrr::map_df(HYF.shap %>% names(), fx, .dat = HYF.shap) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("303603", "303703", "403603", "403703", "504803", "602303", "603503", "603603", "603703", "604503", "604603", "604803"))) %>%
+  dplyr::select(-ylddiff, -fung) %>%
+  # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(phi = phi*0.06725) %>%
+  # Return (loss) on phi, given soybean price. In $/ha:
+  dplyr::mutate(net.val = soy.price*phi) %>%
+  # Net profit: substract cost of fungicide and application:
+  dplyr::mutate(net.prof = net.val - chem.cost) %>%
+  # Get the average net profit per TED:
+  dplyr::group_by(TED) %>%
+  dplyr::mutate(mean.TED = mean(net.prof)) %>%
+  dplyr::ungroup()
+
+g <-
+  HY %>%
+  dplyr::mutate(TED = fct_reorder(TED, -mean.TED)) %>%
+  ggplot(., aes(x = TED, y = net.prof, color = TED)) +
+  coord_flip() +
+  scale_y_continuous(limits = c(-150, 150), expand = c(0.005, 0.005)) +
+  scale_color_viridis_d(option = "D") +
+  labs(x = "TED", y = "Return ($/ha)") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.title = element_text(face = "bold", size = 12),
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.text.x  = element_text(size = 9, angle = 0),
+    axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 9),
+    panel.grid = element_blank() 
+    )
+
+
+g +
+  geom_segment(aes(x = TED, xend = TED, y = 0, yend = mean.TED), size = 0.8) + 
+  geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  annotate("text", x = 1.0, y = -145, size = 2.8, color = "gray20", label = "Soybean price = $576.30/tonne", hjust = 0) +
+  annotate("text", x = 1.5, y = -145, size = 2.8, color = "gray20", label = "Fungicide and application costs = $61.90/ha", hjust = 0) +
+  annotate("text", x = 10.5, y = -35, size = 2.8, color = "gray20", label = "TED average") +
+  geom_curve(aes(x = 10.5, y = -20.0, xend = 10.1, yend = 5.0),
+             arrow = arrow(length = unit(0.07, "inch")), size = 0.4,
+             color = "gray20", curvature = -0.3)
+```
+
+
+#### Tabular summary
+The Figure shows fungicides overwhelmingly profitable, except in 4 TEDs (403603, 602303, 403703, 303603) in which individual fields were about as equally likely to realize a net profit or loss with respect to fungicide application.
+
+* table the mean net profit (loss) for each TED
+
+```{r Econ-Top12-Single-I-Table, eval=TRUE, echo=FALSE, results='markup'}
+HY %>%
+  dplyr::group_by(TED) %>%
+  dplyr::summarise(n = n(), mean.profit = mean(net.prof)) %>%
+  dplyr::arrange(mean.profit)
+```
+
+#### Confidence intervals
+```{r Econ-Top12-Single-I-CI-Table, eval=TRUE, echo=FALSE, results='markup'}
+# For reproducibilty:
+set.seed(14092)
+
+top12.ci <-
+groupwiseMean(net.prof ~ TED,
+              data   = HY,
+              conf   = 0.95,
+              digits = 4,
+              R      = 10000,
+              boot        = TRUE,
+              traditional = FALSE,
+              normal      = FALSE,
+              basic       = FALSE,
+              percentile  = FALSE,
+              bca         = TRUE)
+
+top12.ci %>%
+  dplyr::arrange(Mean)
+```
+
+#### CI plot
+<!-- Supplementary Figure S7 -->
+
+```{r Econ-Top12-Single-I-CI-Fig, eval=TRUE, echo=FALSE}
+top12.ci %>%
+  # want higher importance to appear at the top of the plot:
+  dplyr::arrange(desc(Mean)) %>%
+  dplyr::mutate(TED = factor(TED, levels = .$TED)) %>%
+  ggplot(., aes(y = TED, x = Mean)) +  
+  # geom_segment(aes(y = TED, yend = TED, x = Bca.lower, xend = Bca.upper), size = 1.5, color = "darkslategrey") +
+  # Want to maintain the same color scheme for TEDs throughout the series of graphics:
+  geom_segment(aes(y = TED, yend = TED, x = Bca.lower, xend = Bca.upper, colour = TED), size = 1.5) +
+  geom_point(aes(colour = TED), size = 4) +
+  scale_color_viridis_d(option = "D") +
+  theme_bw() +
+  scale_x_continuous(name = "Return ($/ha)") + 
+  scale_y_discrete(name = "TED") +
+  theme(legend.position = "none") +
+  theme(axis.title.x = element_text(face = "bold", size = 13)) + 
+  theme(axis.title.y = element_text(face = "bold", size = 13)) +
+  theme(axis.text.x  = element_text(size = 10, angle = 0)) +
+  theme(axis.text.y  = element_text(size = 10))
+```
+
+
+### Single price point II
+<!-- Figure 6 -->
+
+* Different shapes for the points representing year
+
+```{r Econ-Top12-Single-II-Fig, eval=TRUE, echo=FALSE}
+# Paul requested a way to represent `year` in the graphic...
+# FIRST: run the code in chunk `shap-Comparisons-Top12-HYF-HYNF`
+
+# Price = $350/t: this is on the low end of soybean prices
+# Mean = $420/t
+# High = $530/t
+
+soy.price <- 576.30
+chem.cost <- 61.90
+
+HY <-
+  purrr::map_df(HYF.shap %>% names(), fx, .dat = HYF.shap) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("303603", "303703", "403603", "403703", "504803", "602303", "603503", "603603", "603703", "604503", "604603", "604803"))) %>%
+  dplyr::select(-ylddiff, -fung) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(phi = phi*0.06725) %>%
+  # Return (loss) on phi, given soybean price. In $/ha:
+  dplyr::mutate(net.val = soy.price*phi) %>%
+  # Net profit: substract cost of fungicide and application:
+  dplyr::mutate(net.prof = net.val - chem.cost) %>%
+  # Get the average net profit per TED:
+  dplyr::group_by(TED) %>%
+  dplyr::mutate(mean.TED = mean(net.prof)) %>%
+  dplyr::ungroup()
+
+# The sample_id values:
+sample_id <- HY %>% dplyr::pull(sample_id)
+  
+# Get the corresponding order numbers:
+order <- 
+  dat %>%
+  tibble::rowid_to_column() %>%
+  dplyr::filter(rowid %in% sample_id) %>%
+  dplyr::rename(sample_id = rowid) %>%
+  dplyr::select(sample_id, order)
+
+# Update HY with the order variable:
+HY <-
+  dplyr::left_join(HY, order, by = "sample_id") %>%
+  # Use the order values to get the associated year for these fields:
+  dplyr::left_join(., dat %>% dplyr::select(order, year), by = "order") %>%
+  dplyr::select(-sample_id)
+
+
+# Plot ... includes different shapes for year
+g <-
+  HY %>%
+  dplyr::mutate(TED = fct_reorder(TED, -mean.TED)) %>%
+  ggplot(., aes(x = TED, y = net.prof, color = TED, shape = factor(year))) +
+  coord_flip() +
+  scale_y_continuous(limits = c(-150, 150), expand = c(0.005, 0.005)) +
+  scale_color_viridis_d(option = "D") +
+  scale_shape_manual(values = c(15, 16, 17)) +
+  labs(x = "TED", y = "Return ($/ha)") +
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold", size = 12),
+    axis.title.x = element_text(face = "bold", size = 12),
+    axis.text.x  = element_text(size = 9, angle = 0),
+    axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 9),
+    panel.grid = element_blank() 
+    ) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical") +
+  # override the transparency of the points for the legend:
+  guides(colour = FALSE, 
+         shape = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1)))
+
+
+g +
+  geom_segment(aes(x = TED, xend = TED, y = 0, yend = mean.TED), size = 0.8) + 
+  geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  # Specify the aesthetics and override so that you don't get separate points for year:
+  stat_summary(aes(x = TED, y = net.prof, color = TED), fun.y = "mean", geom = "point", size = 5, inherit.aes = FALSE) +
+  annotate("text", x = 1.0, y = -145, size = 2.8, color = "gray20", label = "Soybean price = $576.30/tonne", hjust = 0) +
+  annotate("text", x = 1.5, y = -145, size = 2.8, color = "gray20", label = "Fungicide and application costs = $61.90/ha", hjust = 0) +
+  annotate("text", x = 10.5, y = -35, size = 2.8, color = "gray20", label = "TED average") +
+  geom_curve(aes(x = 10.5, y = -20.0, xend = 10.1, yend = 5.0),
+             arrow = arrow(length = unit(0.07, "inch")), size = 0.4,
+             color = "gray20", curvature = -0.3)
+```
+
+
+### Multiple price points
+```{r Econ-Top12-Multiple-Functions, eval=TRUE, echo=FALSE}
+roi <- function(.soyprice, .chemcost = 61.90, .yl = -150, .yu = 150, my.title, .pricelabel) {
+  # A function to plot the return on the yield increase realized by a fungicide, after accounting for application and chemical costs
+  # Args:
+  #  .soyprice = soybean price received in $/tonne
+  #  .chemcost = chemical and application costs ($/ha)
+  #  .yl = lower limit on the y-axis
+  #  .yu = upper limit on the y-axis
+  #  my.title = title (label) for the plot
+  #  .pricelabel = string for adding an annotation on the soybean price received
+  # Returns:
+  #  a plot of the mean return per ($/ha) as well as a jitter of the points for the individual fields
+  #
+  HY <-
+  purrr::map_df(HYF.shap %>% names(), fx, .dat = HYF.shap) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("303603", "303703", "403603", "403703", "504803", "602303", "603503", "603603", "603703", "604503", "604603", "604803"))) %>%
+  dplyr::select(-ylddiff, -fung) %>%
+  # Convert yield from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(phi = phi*0.06725) %>%
+  # Return (loss) on phi, given soybean price. In $/ha:
+  dplyr::mutate(net.val = .soyprice*phi) %>%
+  # Net profit: substract cost of fungicide and application:
+  dplyr::mutate(net.prof = net.val - .chemcost) %>%
+  # Get the average net profit per TED:
+  dplyr::group_by(TED) %>%
+  dplyr::mutate(mean.TED = mean(net.prof)) %>%
+  dplyr::ungroup()
+  
+  # Plot ...
+  g <-
+  HY %>%
+  dplyr::mutate(TED = fct_reorder(TED, -mean.TED)) %>%
+  ggplot(., aes(x = TED, y = net.prof, color = TED)) +
+  coord_flip() +
+  scale_y_continuous(limits = c(.yl, .yu), expand = c(0.005, 0.005)) +
+  scale_color_viridis_d(option = "D") +
+  labs(x = NULL, y = NULL) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x  = element_text(size = 9, angle = 0),
+    axis.text.y  = element_text(size = 7),
+    panel.grid = element_blank()) +
+    ggtitle(my.title) +
+    theme(plot.title = element_text(face = "bold"))
+  
+  g +
+  geom_segment(aes(x = TED, xend = TED, y = 0, yend = mean.TED), size = 0.8) + 
+  geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  annotate("text", x = 2.0, y = -145, size = 2.8, color = "gray20", label = .pricelabel, hjust = 0)
+  }  # end function roi
+```
+
+
+<!-- Supplementary Figure S9 -->
+```{r Econ-Top12-Multiple-Fig, eval=TRUE, echo=FALSE, fig.height=8.0}
+# Set width to 600, Height to 650
+# A multi-component plot
+p1 <- roi(.soyprice = 350, .chemcost = 61.90, my.title = "a", .pricelabel = "$350/tonne")
+
+p2 <- roi(.soyprice = 400, .chemcost = 61.90, my.title = "b", .pricelabel = "$400/tonne")
+
+p3 <- roi(.soyprice = 450, .chemcost = 61.90, my.title = "c", .pricelabel = "$450/tonne")
+
+p4 <- roi(.soyprice = 500, .chemcost = 61.90, my.title = "d", .pricelabel = "$500/tonne")
+
+p5 <- roi(.soyprice = 550, .chemcost = 61.90, my.title = "e", .pricelabel = "$550/tonne")
+
+p6 <- roi(.soyprice = 600, .chemcost = 61.90, my.title = "f", .pricelabel = "$600/tonne")
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2,
+             bottom = grid::textGrob("Return ($/ha)", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12)),
+             left = grid::textGrob("TED", 
+                                   gp = grid::gpar(fontface = "bold", fontsize = 12), rot = 90)
+             )
+```
+
+
+## AllHYF and AllLYF {.tabset .tabset-fade .tabset-pills}
+The economic return due to fungicide on the 100 highest-yielding fields and the 100 lowest-yielding fields in the dataset, all fields having been sprayed.
+
+```{r Econ-All-Functions, eval=TRUE, echo=FALSE}
+# Define a helper function:
+fxa <- function(.dat, .yldenv) {
+  # Extract the phi values from one of the Allxx.shap objects.
+  # Args:
+  #  .dat = one of AllHYF.shap, AllHYNF.shap, AllLYF.shap, AllLYNF.shap
+  #  .yldenv = character string for best- or worst-yielding fields ("Low", "High")
+  # Returns:
+  #  a data frame of the extracted values
+  #
+  # Iterate over all the sample_id (there are 100 fields in each of the `All` groups:
+  purrr::map_df(1:100, function(.i) {
+      .dat %>%
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(yldenv = .yldenv) %>%
+      dplyr::select(sample_id, ylddiff, phi, fung, yldenv)
+  }
+  )
+}  # end fxa
+
+# Define a function targeted to extracting the data from AllHYF.shap, and estimating the roi. 
+roi2 <- function(.soyprice, .chemcost = 61.90, .yl = -150, .yu = 150, my.title, .pricelabel, .xlab = NULL, .ylab = NULL) {
+  # A function to plot the return on the yield increase realized by a fungicide, after accounting for application and chemical costs
+  # Args:
+  #  .soyprice = soybean price received in $/tonne
+  #  .chemcost = chemical and application costs ($/ha)
+  #  .yl = lower limit on the y-axis
+  #  .yu = upper limit on the y-axis
+  #  my.title = title (label) for the plot
+  #  .pricelabel = string for adding an annotation on the soybean price received
+  # Returns:
+  #  a plot of the mean return per ($/ha) as well as a jitter of the points for the individual fields
+  #
+  # Prep the data:
+  x <-
+  dplyr::bind_rows(fxa(.dat = AllHYF.shap, .yldenv = "Sprayed (HY)"),
+                   fxa(.dat = AllLYF.shap, .yldenv = "Sprayed (LY)")) %>%
+  # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(phi = phi*0.06725) %>%
+  # Return (loss) on phi, given soybean price. In $/ha:
+  dplyr::mutate(net.val = .soyprice*phi) %>%
+  # Net profit: substract cost of fungicide and application:
+  dplyr::mutate(net.prof = net.val - .chemcost) 
+  
+  # Plot ...
+  x %>%
+  ggplot(., aes(x = yldenv, y = net.prof, colour = yldenv, shape = yldenv)) +
+  coord_flip() +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  # Based on RColorbrewer qualitative set 1:
+  scale_color_manual(values = c("#377eb8", "#ff7f00")) + 
+  scale_y_continuous(limits = c(.yl, .yu), expand = c(0.005, 0.005)) +
+  labs(x = .xlab, y = .ylab) +
+  theme_bw() +
+  geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 13),
+    axis.text.x  = element_text(size = 11, angle = 0),
+    axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 11),
+    panel.grid = element_blank()
+    ) +
+  annotate("text", x = 0.5, y = -125, size = 3.0, color = "gray20", label = .pricelabel, hjust = 0) +
+    ggtitle(my.title) +
+    theme(plot.title = element_text(face = "bold"))
+  }  # end function roi2
+```
+
+### Single price point {.tabset .tabset-fade .tabset-pills}
+* Price = US576.30/tonne
+
+#### Figure 
+<!-- Supplementary Figure S8 -->
+```{r Econ-All-Single-Price, eval=TRUE, echo=FALSE}
+roi2(.soyprice = 576.30, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = NULL, .pricelabel = "Price = $576.30/tonne", .ylab = "Return ($/ha)")
+```
+
+#### Table
+```{r Econ-All-Single-Price-Table, eval=TRUE, echo=FALSE, results='markup'}
+soy.price <- 576.30
+chem.cost <- 61.90
+
+# Prep the data:
+z <- 
+  dplyr::bind_rows(fxa(.dat = AllHYF.shap, .yldenv = "Sprayed (HY)"),
+                   fxa(.dat = AllLYF.shap, .yldenv = "Sprayed (LY)")) %>%
+  # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+  dplyr::mutate(phi = phi*0.06725) %>%
+  # Return (loss) on phi, given soybean price. In $/ha:
+  dplyr::mutate(net.val = soy.price*phi) %>%
+  # Net profit: substract cost of fungicide and application:
+  dplyr::mutate(net.prof = net.val - chem.cost) %>%
+  dplyr::select(yldenv, net.prof)
+
+# The mean profitability by cohort:
+z %>%
+  dplyr::group_by(yldenv) %>%
+  dplyr::summarise(NetProfit = mean(net.prof))
+```
+
+#### Confidence interval
+Bias Corrected and Accelerated (BCa) bootstrap Confidence Intervals for the mean profitability
+
+```{r Econ-All-Single-Price-CI, eval=TRUE, echo=FALSE, results='markup'}
+# confidence interval for mean profitability
+# library(rcompanion)
+set.seed(14092)
+
+all.ci <-
+groupwiseMean(net.prof ~ yldenv,
+              data   = z,
+              conf   = 0.95,
+              digits = 4,
+              R      = 10000,
+              boot        = TRUE,
+              traditional = FALSE,
+              normal      = FALSE,
+              basic       = FALSE,
+              percentile  = FALSE,
+              bca         = TRUE)
+
+all.ci
+```
+
+
+### Multiple price points
+* A range of prices
+
+<!-- Supplementary Figure S10 -->
+```{r Econ-All-Multiple-Prices, eval=TRUE, echo=FALSE, fig.height=8.0}
+# Set width = 743, height = 650
+p1 <- roi2(.soyprice = 350, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = "a", .pricelabel = "$350/tonne")
+p2 <- roi2(.soyprice = 400, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = "b", .pricelabel = "$400/tonne")
+p3 <- roi2(.soyprice = 450, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = "c", .pricelabel = "$450/tonne")
+p4 <- roi2(.soyprice = 500, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = "d", .pricelabel = "$500/tonne")
+p5 <- roi2(.soyprice = 550, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = "e", .pricelabel = "$550/tonne")
+p6 <- roi2(.soyprice = 600, .chemcost = 61.90, .yl = -150, .yu = 210, my.title = "f", .pricelabel = "$600/tonne")
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2,
+             bottom = grid::textGrob("Return ($/ha)", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12))
+             )
+```
+
+
+
+## HQF and HQNF {.tabset .tabset-fade .tabset-pills}
+* The set of fields in the 90th percentile for yield
+* Must be careful here: for unsprayed fields, chem.cost = 0
+
+```{r Econ-HQ-Functions, eval=TRUE, echo=FALSE}
+roi.hq.mg <- function(.price, .chemcost = 61.90, .ll = -150, .ul = 210, .xlab = NULL, .ylab = NULL, .maintitle = NULL, .pricelabel = "foo", .ann.x = 0.7, .ann.y = -130) {
+  # Plots the roi for HQF fields by MG and fungicide use
+  # Args:
+  #  .price =  soybean price ($/tonne)
+  #  .chemcost = fungicide and application costs ($/ha)
+  #  .ll = lower limit on the y-axis
+  #  .ul = upper limit on the y-axis
+  #  .xlab = x-axis label (be aware we use coord_flip in the plot)
+  #  .ylab = y-axis label
+  #  .maintitle = main title for the plot
+  #  .pricelabel = text label for the soybean price
+  #  .ann.x = x-axis coord for the price label
+  #  .ann.y = y-axis coord for the price label
+  #
+  # Returns:
+  #  a plot of the ROI for the different MGs in the HQF set of fields
+  #
+  # Prepare the data:
+  hq.mg <-
+    dplyr::bind_rows(
+      HQF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "MG.f") %>%
+            dplyr::select(feature.value) %>%
+            stringr::str_remove("MG.f=")})) %>%
+        dplyr::mutate(fung = "Y") %>%
+        dplyr::select(fung, phi, MG) %>%
+        # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = .price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - .chemcost)
+      ,
+      HQNF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "MG.f") %>%
+            dplyr::select(feature.value) %>%
+            stringr::str_remove("MG.f=")})) %>%
+        dplyr::mutate(fung = "N") %>%
+        dplyr::select(fung, phi, MG) %>%
+        # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = .price*phi) %>%
+        # Net profit: substract cost of fungicide and application (zero for unsprayed fields):
+        dplyr::mutate(net.prof = net.val - 0)
+      ) %>%
+    dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+    dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) 
+  
+    
+  # Plot ...
+  hq.mg %>%
+    ggplot(., aes(x = MG, y = net.prof, colour = MG, shape = fung)) +
+    coord_flip() +
+    geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+    stat_summary(fun.y = "mean", geom = "point", size = 5) +
+    # Based on RColorbrewer qualitative set 1:
+    scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+    scale_y_continuous(limits = c(.ll, .ul), expand = c(0.005, 0.005)) +
+    labs(x = .xlab, y = .ylab) +
+    theme_bw() +
+    geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+    theme(
+      legend.position = "bottom", legend.direction = "horizontal", legend.box = "vertical",
+      axis.title.x = element_text(face = "bold", size = 13),
+      axis.text.x  = element_text(size = 10, angle = 0),
+      axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+      axis.text.y  = element_text(size = 10),
+      panel.grid = element_blank()
+      ) +
+    guides(colour = FALSE, shape = FALSE) +
+    annotate("text", x = .ann.x, y = .ann.y, size = 2.5, color = "gray20", label = .pricelabel, hjust = 0) +
+    ggtitle(.maintitle) +
+    theme(plot.title = element_text(face = "bold", size = 12))
+  } # end function roi.hq.mg
+
+# Example of use:
+# roi.hq.mg(.price = 576.30, .chemcost = 61.90, .ll = -150, .ul = 210, .xlab = NULL, .ylab = NULL, .maintitle = NULL)
+
+roi.hq.doy <- function(.price, .chemcost = 61.90, .ll = -150, .ul = 210, .xlab = NULL, .ylab = NULL, .maintitle = NULL) {
+  # Prep the data:
+  hq.doy <- 
+    dplyr::bind_rows(
+      HQF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "doy") %>%
+            dplyr::select(feature.value) %>%
+            stringr::str_remove(".*=") %>%
+            as.numeric()})) %>%
+        dplyr::mutate(fung = "Y") %>%
+        dplyr::select(fung, phi, doy) %>%
+        # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = .price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - .chemcost)
+      ,
+      HQNF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "doy") %>%
+            dplyr::select(feature.value) %>%
+            stringr::str_remove(".*=") %>%
+            as.numeric()})) %>%
+        dplyr::mutate(fung = "N") %>%
+        dplyr::select(fung, phi, doy) %>%
+        # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = .price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - 0) 
+      ) %>%
+    dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed")))
+    
+  
+  # Plot ...  
+  hq.doy %>%
+    ggplot(., aes(x = net.prof, y = doy, colour = doy, shape = fung)) +
+    geom_point(size = 2.0) +
+    scale_colour_distiller(palette = "Spectral") +
+    scale_x_continuous(limits = c(.ll, .ul), expand = c(0.005, 0.005)) +
+    labs(x = .xlab, y = .ylab) +
+    theme_bw() +
+    geom_vline(aes(xintercept = 0), color = "gray70", size = 0.6) +
+    theme(axis.title.x = element_text(face = "bold", size = 13),
+          axis.text.x  = element_text(size = 10, angle = 0),
+          axis.title.y = element_text(face = "bold", size = 13, angle = 90),
+          axis.text.y  = element_text(size = 10)) +
+    theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+    labs(colour = "Sowing\ndate") +
+    guides(shape = FALSE) +
+    ggtitle(.maintitle) +
+    theme(plot.title = element_text(face = "bold", size = 12))
+} # end function roi.hq.doy
+
+
+roi.hq.gdd <- function(.price, .chemcost = 61.90, .ll = -150, .ul = 210, .xlab = NULL, .ylab = NULL, .maintitle = NULL, .pricelabel = "foo", .ann.x = 0.7, .ann.y = -130) {
+  # Plots the roi for HQF fields by GDD and fungicide use
+  # Args:
+  #  .price =  soybean price ($/tonne)
+  #  .chemcost = fungicide and application costs ($/ha)
+  #  .ll = lower limit on the y-axis
+  #  .ul = upper limit on the y-axis
+  #  .xlab = x-axis label (be aware we use coord_flip in the plot)
+  #  .ylab = y-axis label
+  #  .maintitle = main title for the plot
+  #  .pricelabel = text label for the soybean price
+  #  .ann.x = x-axis coord for price label placement
+  #  .ann.y = y-axis coord for price label placement
+  #
+  # Returns:
+  #  a plot of the ROI for the different MGs in the HQF set of fields
+  #
+  # Prepare the data:
+  hq.gdd <-
+    dplyr::bind_rows(
+      HQF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "GDD") %>%
+            dplyr::select(feature.value) %>%
+            stringr::str_remove(".*=")})) %>%
+        dplyr::mutate(fung = "Y") %>%
+        dplyr::select(fung, phi, GDD) %>%
+        # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = .price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - .chemcost) 
+      ,
+      HQNF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "GDD") %>%
+            dplyr::select(feature.value) %>%
+            stringr::str_remove(".*=")})) %>%
+        dplyr::mutate(fung = "N") %>%
+        dplyr::select(fung, phi, GDD) %>%
+        # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = .price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - 0) 
+      ) %>%
+    dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+    dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05")))
+  
+  hq.gdd %>%
+    ggplot(., aes(x = GDD, y = net.prof, colour = GDD, shape = fung)) +
+    coord_flip() +
+    geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+    stat_summary(fun.y = "mean", geom = "point", size = 5) +
+    ggsci::scale_color_uchicago(palette = "dark", drop = FALSE, alpha = 0.8) +
+    theme_bw() +
+    geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+    scale_y_continuous(limits = c(.ll, .ul), expand = c(0.005, 0.005)) +
+    labs(x = .xlab, y = .ylab) +
+    theme(
+      legend.position = "none",
+      axis.title.x = element_text(face = "bold", size = 13),
+      axis.text.x  = element_text(size = 10, angle = 0),
+      axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+      axis.text.y  = element_text(size = 10),
+      panel.grid = element_blank() ) +
+    guides(colour = FALSE, shape = FALSE) +
+    annotate("text", x = .ann.x, y = .ann.y, size = 2.5, color = "gray20", label = .pricelabel, hjust = 0) +
+    ggtitle(.maintitle) +
+    theme(plot.title = element_text(face = "bold", size = 12))
+}  # end function roi.hq.gdd
+```
+
+### Single price point {.tabset .tabset-fade .tabset-pills}
+* $576.30/tonne
+
+
+#### Confidence intervals
+```{r Econ-HQ-CI, eval=TRUE, echo=FALSE, results='markup'}
+soy.price <- 576.30
+chem.cost <- 61.90
+
+hq.ci <-
+    dplyr::bind_rows(
+      HQF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(fung = "Y") %>%
+        dplyr::select(fung, phi) %>%
+        # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = soy.price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - chem.cost) 
+      ,
+      HQNF.shap %>% 
+        dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+          purrr::pluck(.shap, "res") %>% 
+            dplyr::filter(feature == "foliar.fungicide") %>%
+            dplyr::pull(phi)})) %>% 
+        dplyr::mutate(fung = "N") %>%
+        dplyr::select(fung, phi) %>%
+        # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+        dplyr::mutate(phi = phi*0.06725) %>%
+        # Return (loss) on phi, given soybean price. In $/ha:
+        dplyr::mutate(net.val = soy.price*phi) %>%
+        # Net profit: substract cost of fungicide and application:
+        dplyr::mutate(net.prof = net.val - 0) 
+      ) %>%
+    dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed")))
+
+
+set.seed(14092)
+groupwiseMean(net.prof ~ fung,
+              data   = hq.ci,
+              conf   = 0.95,
+              digits = 4,
+              R      = 10000,
+              boot        = TRUE,
+              traditional = FALSE,
+              normal      = FALSE,
+              basic       = FALSE,
+              percentile  = FALSE,
+              bca         = TRUE)
+```
+
+
+#### By MG
+```{r Econ-HQ-MG-Original, eval=FALSE, echo=FALSE}
+# Original, before revising into a function to be able to plot for different price points
+soy.price <- 576.30
+chem.cost <- 61.90
+
+## By MG: All HQ fields, plot points by MG and fungicide use
+hq.mg <-
+  dplyr::bind_rows(
+    HQF.shap %>% 
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove("MG.f=")})) %>%
+      dplyr::mutate(fung = "Y") %>%
+      dplyr::select(fung, phi, MG) %>%
+      # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(phi = phi*0.06725) %>%
+      # Return (loss) on phi, given soybean price. In $/ha:
+      dplyr::mutate(net.val = soy.price*phi) %>%
+      # Net profit: substract cost of fungicide and application:
+      dplyr::mutate(net.prof = net.val - chem.cost) 
+    ,
+    HQNF.shap %>% 
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove("MG.f=")})) %>%
+      dplyr::mutate(fung = "N") %>%
+      dplyr::select(fung, phi, MG) %>%
+      # Convert phi from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(phi = phi*0.06725) %>%
+      # Return (loss) on phi, given soybean price. In $/ha:
+      dplyr::mutate(net.val = soy.price*phi) %>%
+      # Net profit: substract cost of fungicide and application:
+      dplyr::mutate(net.prof = net.val - 0) 
+    ) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV")))
+
+
+# Plot ...
+hq.mg %>%
+  ggplot(., aes(x = MG, y = net.prof, colour = MG)) +
+  coord_flip() +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  facet_wrap(~ fung, ncol = 2) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  # Based on RColorbrewer qualitative set 1:
+  # scale_color_manual(values = c("#377eb8", "#ff7f00")) + 
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  scale_y_continuous(limits = c(-150, 210), expand = c(0.005, 0.005)) +
+  labs(x = "Maturity group", y = "Return ($/ha)") +
+  theme_bw() +
+  # geom_hline(aes(yintercept = 0), color = "gray70", size = 0.6) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 13),
+    axis.text.x  = element_text(size = 10, angle = 0),
+    axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 10),
+    panel.grid = element_blank(),
+    # Bold the facet text labels:
+    strip.text = element_text(face = "bold", size = 10)
+    )
+```
+
+```{r Econ-HQ-MG-Single, eval=TRUE, echo=FALSE}
+roi.hq.mg(.price = 576.30, .xlab = "Maturity group", .ylab = "Return ($/ha)", .pricelabel = "Price = $576.30/tonne")
+```
+
+
+#### By sowing date
+```{r Econ-HQ-doy-Original, eval=FALSE, echo=FALSE}
+## By doy
+hq.doy <- 
+  dplyr::bind_rows(
+    HQF.shap %>% 
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+      dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+      dplyr::mutate(fung = "Y") %>%
+      dplyr::select(fung, phi, doy) %>%
+      # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(phi = phi*0.06725) %>%
+      # Return (loss) on phi, given soybean price. In $/ha:
+      dplyr::mutate(net.val = soy.price*phi) %>%
+      # Net profit: substract cost of fungicide and application:
+      dplyr::mutate(net.prof = net.val - chem.cost)
+    ,
+    HQNF.shap %>% 
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "doy") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=") %>%
+          as.numeric()})) %>%
+      dplyr::mutate(fung = "N") %>%
+      dplyr::select(fung, phi, doy) %>%
+      # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(phi = phi*0.06725) %>%
+      # Return (loss) on phi, given soybean price. In $/ha:
+      dplyr::mutate(net.val = soy.price*phi) %>%
+      # Net profit: substract cost of fungicide and application:
+      dplyr::mutate(net.prof = net.val - 0)
+    ) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed")))  
+
+# Plot ...  
+hq.doy %>%
+  ggplot(., aes(x = net.prof, y = doy, colour = doy)) +
+  geom_point(size = 2.0) +
+  scale_colour_distiller(palette = "Spectral") +
+  facet_wrap(~ fung, ncol = 2) +
+  scale_x_continuous(limits = c(-150, 210), expand = c(0.005, 0.005)) +
+  labs(x = "Return ($/ha)", y = "Sowing date") +
+  theme_bw() +
+  theme(axis.title.x = element_text(face = "bold", size = 13),
+        axis.text.x  = element_text(size = 10, angle = 0),
+        axis.title.y = element_text(face = "bold", size = 13, angle = 90),
+        axis.text.y  = element_text(size = 10),
+        # Bold the facet text labels:
+        strip.text = element_text(face = "bold", size = 10)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Sowing\ndate")
+```
+
+```{r Econ-HQ-doy-Single, eval=TRUE, echo=FALSE}
+roi.hq.doy(.price = 576.30, .xlab = "Return ($/ha)", .ylab = "Sowing date")
+```
+
+
+#### By GDD
+```{r Econ-HQ-GDD-Original, eval=FALSE, echo=FALSE}
+## By GDD
+hq.gdd <-
+  dplyr::bind_rows(
+    HQF.shap %>% 
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "GDD") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(fung = "Y") %>%
+      dplyr::select(fung, phi, GDD) %>%
+      # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(phi = phi*0.06725) %>%
+      # Return (loss) on phi, given soybean price. In $/ha:
+      dplyr::mutate(net.val = soy.price*phi) %>%
+      # Net profit: substract cost of fungicide and application:
+      dplyr::mutate(net.prof = net.val - chem.cost) 
+    ,
+    HQNF.shap %>% 
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "GDD") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(fung = "N") %>%
+      dplyr::select(fung, phi, GDD) %>%
+      # Convert from bu/acre to t/ha (1 bushel/acre = .06725 metric tonnes/ hectare):
+      dplyr::mutate(phi = phi*0.06725) %>%
+      # Return (loss) on phi, given soybean price. In $/ha:
+      dplyr::mutate(net.val = soy.price*phi) %>%
+      # Net profit: substract cost of fungicide and application:
+      dplyr::mutate(net.prof = net.val - 0) 
+    ) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"), labels = c("Unsprayed", "Sprayed"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) 
+
+hq.gdd %>%
+  ggplot(., aes(x = GDD, y = net.prof, colour = GDD)) +
+  coord_flip() +
+  geom_jitter(position = position_jitter(seed = 2019, width = 0.1), size = 2, alpha = 0.25) +
+  facet_wrap(~ fung, ncol = 2) +
+  stat_summary(fun.y = "mean", geom = "point", size = 5) +
+  ggsci::scale_color_uchicago(palette = "dark", drop = FALSE, alpha = 0.8) +
+  theme_bw() +
+  scale_y_continuous(limits = c(-150, 210), expand = c(0.005, 0.005)) +
+  labs(x = "GDD", y = "Return ($/ha)") +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", size = 13),
+    axis.text.x  = element_text(size = 10, angle = 0),
+    axis.title.y = element_text(size = 13, angle = 90, face = "bold"),
+    axis.text.y  = element_text(size = 10),
+    panel.grid = element_blank(),
+    # Bold the facet text labels:
+    strip.text = element_text(face = "bold", size = 10)
+    )
+```
+
+```{r Econ-HQ-GDD-Single, eval=TRUE, echo=FALSE}
+roi.hq.gdd(.price = 576.30, .xlab = "GDD", .ylab = "Return ($/ha)", .pricelabel = "Price = $576.30/tonne", .ann.x = 0.5)
+```
+
+### Multiple price points {.tabset .tabset-fade .tabset-pills}
+#### By MG
+<!-- Supplementary Figure S11 -->
+
+```{r Econ-HQ-MG-Multiple, eval=TRUE, echo=FALSE, fig.height=8.0}
+# Set width = 743, height = 650
+
+p1 <- roi.hq.mg(.price = 350, .maintitle = "a", .pricelabel = "$350/tonne")
+p2 <- roi.hq.mg(.price = 400, .maintitle = "b", .pricelabel = "$400/tonne")
+p3 <- roi.hq.mg(.price = 450, .maintitle = "c", .pricelabel = "$450/tonne")
+p4 <- roi.hq.mg(.price = 500, .maintitle = "d", .pricelabel = "$500/tonne")
+p5 <- roi.hq.mg(.price = 550, .maintitle = "e", .pricelabel = "$550/tonne")
+p6 <- roi.hq.mg(.price = 600, .maintitle = "f", .pricelabel = "$600/tonne")
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2,
+             left = grid::textGrob("Maturity group", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12), rot = 90),
+             bottom = grid::textGrob("Return ($/ha)", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12))
+             )
+```
+
+
+#### By GDD
+```{r Econ-HQ-GDD-Multiple, eval=TRUE, echo=FALSE, fig.height=8.0}
+p1 <- roi.hq.gdd(.price = 350, .maintitle = "a", .pricelabel = "$350/tonne", .ann.x = 0.6)
+p2 <- roi.hq.gdd(.price = 400, .maintitle = "b", .pricelabel = "$400/tonne", .ann.x = 0.6)
+p3 <- roi.hq.gdd(.price = 450, .maintitle = "c", .pricelabel = "$450/tonne", .ann.x = 0.6)
+p4 <- roi.hq.gdd(.price = 500, .maintitle = "d", .pricelabel = "$500/tonne", .ann.x = 0.6)
+p5 <- roi.hq.gdd(.price = 550, .maintitle = "e", .pricelabel = "$550/tonne", .ann.x = 0.6)
+p6 <- roi.hq.gdd(.price = 600, .maintitle = "f", .pricelabel = "$600/tonne", .ann.x = 0.6)
+
+grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2,
+             bottom = grid::textGrob("Return ($/ha)", 
+                                     gp = grid::gpar(fontface = "bold", fontsize = 12))
+             )
+```
+
+
+
+# Computing environment
+```{r SessionInfo}
+# Last run on R version 3.5.3 (2019-03-11)
+R.Version()$version.string
+R.Version()$system
+sessionInfo()
+```

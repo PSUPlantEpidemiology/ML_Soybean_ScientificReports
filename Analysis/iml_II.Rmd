@@ -1,0 +1,539 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# iml package functions
+```{r iml_library, eval=FALSE, echo=FALSE}
+library(iml)
+```
+
+```{r iml_meanyield, eval=FALSE, echo=FALSE}
+# The mean predicted yield from the random forest model:
+mean(predict(caret_rf))
+# or...
+mean(predict(rfo, data = datII)$predictions)
+```
+
+```{r iml_setup, eval=TRUE, echo=FALSE}
+# We create a Predictor object, that holds the model and the data. The iml package uses R6 classes.
+# NOTE: iml does not interface with ranger objects (throws an error message). The documentation for iml indicates that they prefer interfacing through caret or mlr. So, we use the random forest model fit via caret (calling ranger):
+
+# imlpredobj <- Predictor$new(caret_rf, data = x, y = y)
+
+# However, if you follow Section 16.2.3 in Boehmke and Greenwell, they show how to create a model-agnostic object for iml. So, you can do this for the ranger model:
+
+# data.frame with just the features: is just the object x
+# vector of the actual responses: is just the object y
+# a custom predict function that returns the ranger predicted values as a vector:
+pred <- function(object, newdata) {
+  results <- predict(object, data = newdata)$predictions
+  return(results)
+}
+
+# iml model-agnostic object:
+imlpredobj <- Predictor$new(model = rfo,
+                            data = x,
+                            y = y,
+                            predict.fun = pred)
+
+# Load iml feature importance and interaction results:
+# load("~/EskerSoybean/ScientificReportsGitHub/Analysis/imlResults.RData")
+
+load("../Data/imlResults.RData")
+```
+
+
+
+## Feature importance
+The feature importance measure works by shuffling each feature and measuring how much the performance drops. Here we measure the loss in performance with the mean absolute error (`mae`). Another choice would be the mean squared error (`mse`).
+
+This is a more principled way of measuring feature importance than basing it off the impurity score: compare to the relative importance plot in `Section 3.2.1`.
+
+```{r iml_FeatureImportance_Fit, eval=FALSE, echo=FALSE, warning=FALSE}
+# Couple of issues. You need to up the number of repetitions to get more stable estimates, but doing so in a serial manner leads to computation times of several minutes:
+# iml.imp <- FeatureImp$new(imlpredobj, loss = "mae", n.repetitions = 10)
+
+# iml allows FeatureImp to be computed in parallel, but when I tried it there is a warning generated:
+# 'In e$fun(obj, substitute(ex), parent.frame(), e$data) : already exporting variable(s): self'
+
+# The iml.imp object is fit though, and the plot does not indicate any problems. So we'll go ahead and try it in parallel:
+## Configure parallel processing
+cluster <- parallel::makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+doParallel::registerDoParallel(cluster)
+
+iml.imp <- FeatureImp$new(imlpredobj, loss = "mae", parallel = TRUE, n.repetitions = 20)
+
+# De-register parallel processing cluster
+# After processing the data, we explicitly shut down the cluster by calling the stopCluster() and registerDoSEQ() functions. The registerDoSEQ() function is required to force R to return to single threaded processing.
+stopCluster(cluster)
+registerDoSEQ()
+
+
+# The outputted object iml.imp is an Environment, which takes up a LOT of space when stored to a RData object.
+# So, just extract the results and save the much smaller data.frame:
+iml.imp.results <- iml.imp$results
+```
+
+
+```{r iml_FeatureImportance_Plot, eval=TRUE, echo=FALSE}
+# Note: to reproduce the plot that is given by plot(iml.imp), I looked into the iml code on GitHub: https://github.com/christophM/iml/tree/master/R
+
+iml.imp.results %>%
+  # want higher importance to appear at the top of the plot:
+  dplyr::arrange(importance) %>%
+  dplyr::mutate(feature = factor(feature, levels = .$feature)) %>%
+  ggplot(., aes(y = feature, x = importance)) +  
+  geom_segment(aes(y = feature, yend = feature, x = importance.05, xend = importance.95), size = 1.5, 
+               color = "darkslategrey") +
+  geom_point(size = 3) +
+  scale_x_continuous(name = "Feature Importance (loss = mae)") + 
+  scale_y_discrete(name = "Feature") +
+   theme(axis.title.x = element_text(face = "bold", size = 11)) + 
+  ylab("Variable") + 
+  theme(axis.title.y = element_text(face = "bold", size = 11))
+```
+
+
+## Feature effects
+We are also interested in how the features influence the predicted outcome. 
+
+This can be done via:  
+
+* accumulated local effects (ALE)  
+* partial dependence plots  
+* individual conditional expectation (ICE) curves
+
+We have already done partial dependence plots and ICE curves. Will focus here on ALE.
+
+### ALE {.tabset .tabset-fade .tabset-pills}
+ALE shows how the prediction changes locally, when the feature is varied. 
+
+The marks on the x-axis indicates the distribution of the feature, showing how relevant a region is for interpretation (little or no points mean that we should not over-interpret this region).
+
+NOTE: I've placed all ALE plots on the same y-axis scaling (-12 to 5 for continuous predictors, and -7 to 2 for categorical predictors). This avoids "blowing up" minor effects, giving the impression that they are of greater importance than they actually are.
+
+```{r iml_ALE_functions, eval=TRUE, echo=FALSE}
+plot.ALE.cont <- function(ly = -12, uy = 5, x.label = NULL) {
+  # ALE plot for continuous predictors
+  # Args:
+  #  ly = lower y limit
+  #  uy = upper y limit
+  #  x.label = x-axis label
+  #
+  # Returns:
+  #  an ALE plot
+  #
+  plot(iml.ale, ylim = c(ly, uy)) + 
+  theme_bw() +
+  xlab(x.label) +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+} # end function plot.ALE.cont
+
+
+plot.ALE.cat <- function(fctr, levels, labels, x.label = NULL, ly = -7, uy = 2) {
+  # Plot ALE for categorical predictors
+  # Args:
+  #  fctr = the name of the categorical predictor (unquoted)
+  #  levels = the levels of the predictor
+  #  labels = the labels for the predictor levels
+  #  x.label = label for the x-axis
+  #  ly = lower y limit
+  #  uy = upper y limit
+  #
+  # Returns:
+  #  a plot of the ALE values
+  #
+  .var <- enquo(fctr)
+  .name <- quo_name(.var)
+  
+  iml.ale$results %>%
+  dplyr::mutate(!!.name := factor(!!.var, levels = levels, labels = labels)) %>% 
+  dplyr::mutate(lower = .ale + 0, upper = .ale + 0) %>%
+  ggplot(., aes(x = !!.var, y = .ale)) + 
+  geom_crossbar(aes(ymin = lower, ymax = upper), width = 0.3) +
+  theme_light() +
+  ylim(ly, uy) +
+  xlab(x.label) +
+  ylab("ALE") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+}  # end function plot.ALE.cat
+```
+
+
+#### Latitude
+```{r iml_ALE_latitude, eval=TRUE, echo=FALSE}
+iml.ale <- FeatureEffect$new(imlpredobj, feature = "latitude", grid.size = 30)
+
+# I tried different things, but cannot remove the "of .y" in the y-axis label.
+# plot(iml.ale, ylim = c(-15, 10)) + 
+#   theme_bw() +
+#   xlab("Latitude") +
+#   theme(axis.title.x = element_text(face = "bold", size = 12),
+#         axis.text.x  = element_text(size = 8, angle = 0),
+#         axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+#         axis.text.y  = element_text(size = 8))
+
+# Well, you can extract the data frame of the results (iml.ale$results), and then plot using geom_line. But you lose the rug, and would have to write code to add this back in.
+
+plot.ALE.cont(x.label = "Latitude")
+```
+
+#### Day-of-year
+```{r iml_ALE_doy, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("doy")
+
+plot.ALE.cont(x.label = "Day of year")
+```
+
+#### Topsoil organic matter content
+```{r iml_ALE_topsoilOM, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("OM.0.30.cm")
+
+plot.ALE.cont(x.label = "Topsoil organic matter (%)")
+```
+
+#### Topsoil pH
+```{r iml_ALE_topsoilpH, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("pH.0.30.cm")
+
+plot.ALE.cont(x.label = "Topsoil pH")
+```
+
+#### Seeding rate
+```{r iml_ALE_seedingrate, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("seed.rate")
+
+plot.ALE.cont(x.label = "Seeding rate")
+```
+
+#### GDD
+Consistent with the partial dependence plot in `Section 3.2.2.2.1`.
+```{r iml_ALE_GDD, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("GDD")
+
+levs <- labs <- c("01", "02", "03", "04", "05")
+plot.ALE.cat(GDD, levels = levs, labels = labs, x.label = "GDD")
+```
+
+#### Foliar fungicide
+```{r iml_ALE_fungicide, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("foliar.fungicide")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(foliar.fungicide, levels = levs, labels = labs, x.label = "Foliar fungicide use")
+```
+
+#### Foliar insecticide
+```{r iml_ALE_insecticide, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("foliar.insecticide")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(foliar.insecticide, levels = levs, labels = labs, x.label = "Foliar insecticide use")
+```
+
+#### TWI
+```{r iml_ALE_TWI, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("TWI")
+
+plot.ALE.cont(x.label = "TWI")
+```
+
+#### Aridity index
+```{r iml_ALE_AI, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("AI")
+
+levs <- labs <- c("1", "2", "3", "4", "5", "6", "7", "8")
+plot.ALE.cat(AI, levels = levs, labels = labs, x.label = "AI")
+```
+
+#### Topsoil texture
+```{r iml_ALE_topsoiltexture, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("texture.0.30")
+
+levs <- labs <- c("Clay_Loam", "Loamy_Sand", "Sandy_Loam", "Silt_Loam", "Silty_Clay_Loam")
+plot.ALE.cat(texture.0.30, levels = levs, labels = labs, x.label = "Topsoil texture")
+```
+
+#### Soybean maturity group
+```{r iml_ALE_MG, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("MG.f")
+
+levs <- labs <- c("0", "I", "II", "III", "IV")
+plot.ALE.cat(MG.f, levels = levs, labels = labs, x.label = "Maturity group")
+```
+
+#### PAWR
+```{r iml_ALE_PAWR, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("PAWR")
+
+levs <- labs <- c("1", "2", "3", "4", "5", "6", "7")
+plot.ALE.cat(PAWR, levels = levs, labels = labs, x.label = "PAWR")
+```
+
+#### Row spacing
+```{r iml_ALE_rowspacing, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("row.space")
+
+levs <- c("row7", "row10", "row15", "row22", "row30")
+labs <- c("7-inch", "10-inch", "15-inch", "22-inch", "30-inch")
+plot.ALE.cat(row.space, levels = levs, labels = labs, x.label = "Row spacing")
+```
+
+#### Herbicide use
+```{r iml_ALE_herbicide, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("herbicide")
+
+levs <- c("none", "pre", "post", "both")
+labs <- c("None", "Pre", "Post", "Both")
+plot.ALE.cat(herbicide, levels = levs, labels = labs, x.label = "Herbicide use")
+```
+
+#### Seed treatment
+```{r iml_ALE_seedtrt, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("seed.trt1")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(seed.trt1, levels = levs, labels = labs, x.label = "Seed treatment use")
+```
+
+#### Manure
+```{r iml_ALE_manure, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("manure")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(manure, levels = levs, labels = labs, x.label = "Manure use")
+```
+
+#### Starter fertilizer
+```{r iml_ALE_starterfert, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("starter.fert")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(starter.fert, levels = levs, labels = labs, x.label = "Starter fertilizer use")
+```
+
+#### Iron deficiency
+```{r iml_ALE_irondef, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("iron.def")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(iron.def, levels = levs, labels = labs, x.label = "Iron deficiency")
+```
+
+#### Lime
+```{r iml_ALE_lime, eval=TRUE, echo=FALSE}
+iml.ale$set.feature("lime")
+
+levs <- c("no", "yes")
+labs <- c("No", "Yes")
+plot.ALE.cat(lime, levels = levs, labels = labs, x.label = "Lime use")
+```
+
+
+## Measure interactions {.tabset .tabset-fade .tabset-pills}
+We can also measure how strongly features interact with each other. The interaction measure regards how much of the variance of `f(x)` is explained by the interaction. The measure is between 0 (no interaction) and 1 (= 100% of variance of `f(x)` due to interactions). For each feature, we measure how much they interact with any other feature.
+
+
+The variables with the strongest interaction signals are `latitude` and `doy`.  Interestingly, `foliar fungicide` had the third largest signal, so we'll look at that too.
+
+```{r iml_Interactions, eval=FALSE, echo=FALSE}
+# This is a large environment object after fitting:
+interact <- Interaction$new(imlpredobj, grid.size = 30)
+
+# plot(interact)
+
+# save the data frame of the results, this is a smaller object:
+iml.inter.results <- interact$results
+```
+
+
+```{r iml_Interactions_plot, eval=TRUE, echo=FALSE}
+iml.inter.results %>%
+  # want higher interactions to appear at the top of the plot:
+  dplyr::arrange(.interaction) %>%
+  dplyr::mutate(.feature = factor(.feature, levels = .$.feature)) %>%
+  ggplot(., aes(y = .feature, x = .interaction)) + 
+  geom_point() + 
+  scale_x_continuous("Overall interaction strength") + 
+  scale_y_discrete("Features") +
+  theme(axis.title.x = element_text(face = "bold", size = 11)) +
+  theme(axis.title.y = element_text(face = "bold", size = 11))
+```
+
+
+### Two-way interactions {.tabset .tabset-fade .tabset-pills}
+```{r iml_int_2way_notes, eval=FALSE, echo=FALSE}
+## NOTE: the documentation indicated that you can set this up with parallel processing. It did fit, but there was a warning generated, and the results were somewhat different.
+###
+## Configure parallel processing
+# cluster <- parallel::makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+# doParallel::registerDoParallel(cluster)
+# 
+# ix2 <- Interaction$new(imlpredobj, feature = "doy", parallel = TRUE)
+# 
+# # De-register parallel processing cluster
+# # After processing the data, we explicitly shut down the cluster by calling the stopCluster() and registerDoSEQ() functions. The registerDoSEQ() function is required to force R to return to single threaded processing.
+# stopCluster(cluster)
+# registerDoSEQ()
+# 
+# plot(ix2)
+###
+```
+
+#### Latitude {.tabset .tabset-fade .tabset-pills}
+##### Results
+```{r iml_Int_latitude_fit, eval=FALSE, echo=FALSE}
+# Using a larger grid size than the default because of the number of obs in this data:
+# NOTE: the fitted object is an environment.
+ix.lat <- Interaction$new(imlpredobj, feature = "latitude", grid.size = 30)
+
+# Extract the results and save:
+ix.lat.res <- ix.lat$results
+```
+
+```{r iml_Int_latitude_plot, eval=TRUE, echo=FALSE}
+ix.lat.res %>%
+  dplyr::arrange(.interaction) %>%
+  dplyr::mutate(.feature = factor(.feature, levels = .$.feature)) %>%
+  ggplot(., aes(y = .feature, x = .interaction)) + 
+  geom_point() + 
+  scale_x_continuous("Overall interaction strength") + 
+  scale_y_discrete("Features") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+```
+
+##### Two-way PDP
+Two-way partial dependence plot between latitude and doy. Very computationally demanding! The default plot afterwards is not very informative -- the wireframe returned from `pdp` is better for interpretation.
+
+Nevertheless, can extract and save the data frame, and perhaps use that at some later point.
+
+```{r iml_Int_latitude_doy, eval=FALSE, echo=FALSE}
+# This is very computationally intensive! It fit, but gave warning that Partial is deprecated.
+# inter.pdp.lat <- Partial$new(
+#   imlpredobj,
+#   c("latitude", "doy"),
+#   ice = FALSE,
+#   grid.size = 30
+# )
+
+# The plot is not that useful. The wireframe plot given by the pdp package is more useful.
+# plot(inter.pdp.lat)
+
+# Set up with FeatureEffect:
+inter.pdp.lat.doy <- FeatureEffect$new(
+  imlpredobj,
+  feature = c("latitude", "doy"),
+  method = "pdp",
+  grid.size = 30
+)
+
+# Can save the results and manipulate at some later time.
+inter.pdp.lat.doy.res <- inter.pdp.lat.doy$results
+```
+
+
+#### Day-of-year {.tabset .tabset-fade .tabset-pills}
+##### Results
+Was very surprised that the highest interaction effect with `doy` was `foliar fungicide`!
+```{r iml_Int_doy_fit, eval=FALSE, echo=FALSE}
+ix.doy <- Interaction$new(imlpredobj, feature = "doy", grid.size = 30)
+
+# Extract the results and save:
+ix.doy.res <- ix.doy$results
+```
+
+
+```{r iml_Int_doy_plot, eval=TRUE, echo=FALSE}
+ix.doy.res %>%
+  dplyr::arrange(.interaction) %>%
+  dplyr::mutate(.feature = factor(.feature, levels = .$.feature)) %>%
+  ggplot(., aes(y = .feature, x = .interaction)) + 
+  geom_point() + 
+  scale_x_continuous("Overall interaction strength") + 
+  scale_y_discrete("Features") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+```
+
+##### Two-way PDP
+Two-way partial dependence plot between doy and foliar fungicide.  This is the default plot.
+I'll save the results so that we can customize and replot later if so desired.
+```{r iml_Int_doy_fungicide_fit, eval=TRUE, echo=FALSE}
+# Set up with FeatureEffect:
+inter.pdp.doy.fungicide <- FeatureEffect$new(
+  imlpredobj,
+  feature = c("doy", "foliar.fungicide"),
+  method = "pdp",
+  grid.size = 30
+)
+
+plot(inter.pdp.doy.fungicide)
+
+# Can save the results and manipulate at some later time. However, this does not save the data for the rug, which you'll have to customize and add later.
+# inter.pdp.doy.fungicide.res <- inter.pdp.doy.fungicide$results
+```
+
+
+#### Foliar fungicide {.tabset .tabset-fade .tabset-pills}
+##### Results
+The highest interaction effect is foliar fungicide and latitude.
+```{r iml_Int_fungicide_fit, eval=FALSE, echo=FALSE}
+ix.fungicide <- Interaction$new(imlpredobj, feature = "foliar.fungicide", grid.size = 30)
+
+# Extract the results and save:
+ix.fungicide.res <- ix.fungicide$results
+```
+
+
+```{r iml_Int_fungicide_plot, eval=TRUE, echo=FALSE}
+ix.fungicide.res %>%
+  dplyr::arrange(.interaction) %>%
+  dplyr::mutate(.feature = factor(.feature, levels = .$.feature)) %>%
+  ggplot(., aes(y = .feature, x = .interaction)) + 
+  geom_point() + 
+  scale_x_continuous("Overall interaction strength") + 
+  scale_y_discrete("Features") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+```
+
+
+##### Two-way PDP
+Two-way partial dependence plot between foliar fungicide and latitude.  
+```{r iml_Int_fungicide_latitude, eval=TRUE, echo=FALSE}
+# Set up with FeatureEffect:
+inter.pdp.fungicide.latitude <- FeatureEffect$new(
+  imlpredobj,
+  feature = c("foliar.fungicide", "latitude"),
+  method = "pdp",
+  grid.size = 30
+)
+
+plot(inter.pdp.fungicide.latitude)
+
+# Can save the results and manipulate at some later time.
+# inter.pdp.fungicide.latitude.res <- inter.pdp.fungicide.latitude$results
+```
+
+

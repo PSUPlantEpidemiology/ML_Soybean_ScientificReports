@@ -1,0 +1,160 @@
+---
+title: "RFTest"
+author: Denis Shah
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    fig_caption: yes
+    highlight: tango
+    number_sections: true
+    theme: cerulean
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, eval=TRUE}
+require(knitr)
+knitr::opts_chunk$set(cache=TRUE, fig.path = 'RFTestFigure/')
+```
+
+
+<!--- Load libraries and process data for plotting -->
+```{r libraries, echo=FALSE, eval=TRUE, message=FALSE}
+library(tidyverse)
+# tidyverse_packages(include_self = FALSE)
+# Loads: dplyr forcats ggplot2 lubridate purrr tibble
+
+library(caret)
+library(ranger)
+library(tuneRanger)
+library(mlr)
+```
+
+
+```{r RFDataPrep, eval=TRUE, echo=FALSE, results='hide'}
+# load("~/EskerSoybean/ScientificReportsGitHub/Data/Mgmt.RData")
+# for knitr only:
+load("../Data/Mgmt.RData")
+
+# For modeling drop: order, state, year, TED, longitude
+datII <- dat %>% dplyr::select(-order, -state, -year, -TED, -longitude)
+
+# Set seed for reproducibility:
+set.seed(14092)
+
+# Create training & testing data sets:
+# Use 0.80 split to avoid warnings about empty factor levels when mlr is creating the task:
+inTraining <- caret::createDataPartition(datII$yield, p = 0.80, list = FALSE)
+training <- datII[inTraining, ]
+testing <- datII[-inTraining, ]
+
+# For tuneRanger, a mlr task has to be created
+soy.task <- mlr::makeRegrTask(data = as.data.frame(training), target = "yield")
+```
+
+
+
+```{r DifferentTuningMethods}
+# I am following the approaches outlined in `Hands-on Machine Learning with R`, and also the references by Probst in which they describe the tuneRanger package.
+
+# number of features
+n_features <- length(setdiff(names(training), "yield"))
+
+# The model I had been using:
+rfo <- ranger::ranger(yield ~ ., data = training, num.trees = 1500, mtry = 8, importance = "impurity", min.node.size = 5, splitrule = "variance", seed = 14092)
+sqrt(rfo$prediction.error)
+
+# train a default random forest model
+rf1 <- ranger(
+  yield ~ ., 
+  data = training,
+  mtry = floor(n_features / 3),
+  respect.unordered.factors = "order",
+  seed = 14092
+)
+
+# get OOB RMSE
+(default_rmse <- sqrt(rf1$prediction.error))
+
+
+## Hyperparameters
+# Number of trees
+# A good rule of thumb is to start with 10 times the number of features, which in this case is 200
+# However, you can see that this is lower than the default of 500 trees, and leads to a higher OOB RMSE:
+rf2 <- ranger::ranger(yield ~ ., data = training, num.trees = 200, mtry = floor(n_features / 3), importance = "impurity", seed = 14092)
+sqrt(rf2$prediction.error)
+
+
+# create hyperparameter grid
+hyper_grid <- expand.grid(
+  mtry = seq(2, 20, 2),
+  min.node.size = c(1:5), 
+  replace = FALSE,                               
+  sample.fraction = c(.6, .65, .7, .75, .8, .85)                                             
+)
+
+
+# execute full cartesian grid search
+for(i in seq_len(nrow(hyper_grid))) {
+  # fit model for ith hyperparameter combination
+  fit <- ranger(
+    formula         = yield ~ ., 
+    data            = training, 
+    num.trees       = n_features * 10,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$min.node.size[i],
+    replace         = hyper_grid$replace[i],
+    sample.fraction = hyper_grid$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 14092,
+    respect.unordered.factors = 'order',
+    splitrule = "variance"
+  )
+  # export OOB error 
+  hyper_grid$rmse[i] <- sqrt(fit$prediction.error)
+}
+
+# assess top 10 models
+hyper_grid %>%
+  arrange(rmse) %>%
+  mutate(perc_gain = (default_rmse - rmse) / default_rmse * 100) %>%
+  head(10)
+
+# Use the grid search results and fit with more trees:
+rf4 <- ranger::ranger(yield ~ ., data = training, 
+                      num.trees = 1500, 
+                      mtry = 6, 
+                      importance = "impurity", 
+                      min.node.size = 2, 
+                      replace = FALSE,
+                      sample.fraction = 0.85,
+                      respect.unordered.factors = 'order',
+                      seed = 14092)
+sqrt(rf4$prediction.error)
+
+
+
+### with tuneRanger (following Probst et al and the documentation)
+# Rough Estimation of the Tuning time
+estimateTimeTuneRanger(soy.task)
+
+# Tuning process:
+rf3 <- tuneRanger(soy.task, num.trees = 3000)
+
+# Mean of best 5 % of the results
+rf3
+# Model with the new tuned hyperparameters
+rf3$model
+
+# recommended parameters
+rf3$recommended.pars
+
+# the OOB RMSE
+sqrt(rf3$model$learner.model$prediction.error)
+```
+
+
+

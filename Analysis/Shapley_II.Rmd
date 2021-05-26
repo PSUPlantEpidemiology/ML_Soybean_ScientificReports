@@ -1,0 +1,4351 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r fastshap, eval=FALSE, echo=FALSE}
+# NOTE: you may want to look at fastshap: Fast Approximate Shapley Values R package, which is very new. Computation of Shapley values can be demanding, and we want to do this for many (100's) of obs in a set!!
+
+# 1/31/2020: I tried the package, but ran into a problem in that it seems not to recognize the custom pred function created for getting ranger to work with iml.
+```
+
+```{r Shapley_Exploration, eval=FALSE, echo=FALSE}
+# Single row with the instance to be explained:
+shapley <- Shapley$new(imlpredobj, x.interest = x[1, ], sample.size = 100)
+
+# Plot the results:
+plot(shapley)
+
+# The actual prediction for the obs:
+shapley$y.hat.interest
+# The mean predicted yield over all obs:
+shapley$y.hat.average
+
+# The results in data.frame form can be extracted like this:
+# The columns are: feature, phi, phi.var, feature.value
+shapley$results %>% head()
+
+# And you can plot the results...
+shapley$results %>%
+  mutate(feature.value = forcats::fct_reorder(feature.value, phi)) %>%
+  ggplot(., aes(x = feature.value, phi, y = phi)) +
+  geom_col() +
+  coord_flip() +
+  ggtitle(sprintf("Actual prediction: %.2f\nAverage prediction: %.2f", 
+          shapley$y.hat.interest, shapley$y.hat.average))
+
+
+###
+# You have to figure out how to efficiently estimate the shapley values for the sets of obs that you're interested in, e.g. top 20 fields in a TED, then how do you summarize?
+
+## A function to get the relevant results out of a shapley environment object:
+shapr <- function(i) {
+  shapley <- Shapley$new(imlpredobj, x.interest = x[i, ], sample.size = 20)
+  
+  return(list(
+  res = shapley$results,
+  # The actual prediction for the obs:
+  actual = shapley$y.hat.interest,
+  # The mean predicted yield over all obs:
+  mean = as.vector(shapley$y.hat.average)))
+}
+
+# example of use:
+shapr(2736)
+
+
+# Getting the shapley data is going to take some time, so best to get that first and save the objects:
+HYF <- TEDHYPredData(getTED = 303603, x = 4, fung = "yes") %>% 
+  dplyr::select(sample_id) %>%
+  dplyr::mutate(shap = map(sample_id, shapr))
+
+
+# Once you have that object, can add on the plots of the shapley values.
+## A function to plot the shapley values:
+shap.plotII <- function(id, z) {
+  res <- z %>% purrr::pluck("res")
+  actual <- z %>% purrr::pluck("actual")
+  mn <- z %>% purrr::pluck("mean")
+  
+  res %>%
+  mutate(feature.value = forcats::fct_reorder(feature.value, phi)) %>%
+  ggplot(., aes(x = feature.value, y = phi)) +
+  geom_col() +
+  coord_flip() +
+  xlab(NULL) +
+  ylab(paste("Obs: ", id)) +
+  ggtitle(sprintf("Actual prediction: %.2f\nAverage prediction: %.2f", 
+          actual, mn)) +
+  theme(plot.title = element_text(size = 8, face = "bold"),
+        axis.text.y = element_text(size = 8),
+        axis.text.x = element_text(size = 8),
+        axis.title.x = element_text(size = 8, face = "bold"))
+}
+
+# Example of use:
+shap.plotII(id = 2736, shapr(2736))
+
+
+# But the bar chart output (which is the default) has a lot of ink, so can simplify by using a dotplot (as on page 336 of Boehmke and Greenwell):
+shap.plotIII <- function(id, z) {
+  res <- z %>% pluck("res")
+  actual <- z %>% pluck("actual")
+  mn <- z %>% pluck("mean")
+  
+  res %>%
+  mutate(feature.value = forcats::fct_reorder(feature.value, phi)) %>%
+  ggplot(., aes(x = phi, y = feature.value, colour = phi > 0)) +
+  geom_point(show.legend = F) +
+  ylab(NULL) +
+  xlab(paste("Obs: ", id)) +
+  ggtitle(sprintf("Actual prediction: %.2f\nAverage prediction: %.2f", 
+          actual, mn)) +
+  theme_bw() +
+  geom_vline(xintercept = 0, linetype = 2) +
+  theme(plot.title = element_text(size = 8, face = "bold"),
+        axis.text.y = element_text(size = 8),
+        axis.text.x = element_text(size = 8),
+        axis.title.x = element_text(size = 8, face = "bold"))
+}
+
+# Example of use:
+shap.plotIII(id = 2736, shapr(2736))
+
+
+# Now you can add on the shapley plots:
+tst <- HYF %>% 
+  dplyr::mutate(plt = map2(sample_id, shap, shap.plotIII)) 
+
+# And plot in a grid:
+gridExtra::grid.arrange(grobs = tst %>% pluck("plt"), ncol=2, nrow=2,
+                        bottom = grid::textGrob("phi", gp = grid::gpar(fontsize = 12, fontface = "bold")),
+                        left = grid::textGrob("Feature value", rot = 90, gp = grid::gpar(fontsize = 12, 
+                                                                                         fontface = "bold")))
+```
+
+
+```{r Shapley_Load_FittedObjects, eval=TRUE, echo=FALSE}
+# load("~/EskerSoybean/Manuscripts/TommyPaperAnalysisII/ShapFits.RData")
+
+load("../Data/ShapFits.RData")
+```
+
+
+# Shapley values: latitude
+## The highest-yielding fungicide-treated and untreated fields {.tabset .tabset-fade .tabset-pills}
+* These are the Shapley phi values associated with `latitude` for this set of fields.
+
+```{r shap_HQ_latitude_data, eval=TRUE, echo=FALSE}
+# Prep the data:
+# phi (latitude), ylddiff, foliar fungicide, MG
+sh.x <-
+  dplyr::bind_rows(
+    HQF.shap %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "latitude") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(lat = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "latitude") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=") %>%
+          as.numeric()})) %>%
+      dplyr::mutate(fung = "Y") %>%
+      dplyr::select(ylddiff, phi, MG, lat, fung)
+    ,
+    HQNF.shap %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "latitude") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(lat = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "latitude") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=") %>%
+          as.numeric()})) %>%
+      dplyr::mutate(fung = "N") %>%
+      dplyr::select(ylddiff, phi, MG, lat, fung)
+  )
+```
+
+### By foliar fungicide
+```{r shap_HQ_latitude_ff, eval=TRUE, echo=FALSE}
+# New facet label names for fung variable
+supp.labs <- c("Not Sprayed", "Sprayed")
+names(supp.labs) <- c("N", "Y")
+
+sh.x %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = lat)) +
+  geom_point() +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ fung, ncol = 1, labeller = labeller(fung = supp.labs)) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Latitude")
+```
+
+### By maturity group
+```{r shap_HQ_latitude_MG, eval=TRUE, echo=FALSE}
+sh.x %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = lat)) +
+  geom_point() +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ MG) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Latitude")
+```
+
+
+# Shapley values: GDD
+## The highest-yielding fungicide-treated and untreated fields {.tabset .tabset-fade .tabset-pills}
+* These are the Shapley phi values associated with `GDD` for this set of fields.
+
+```{r shap_HQ_GDD_data, eval=TRUE, echo=FALSE}
+## Prep the data:
+# phi (GDD), ylddiff, foliar fungicide, MG
+sh.x <-
+  dplyr::bind_rows(
+    HQF.shap %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "GDD") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "GDD") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(fung = "Y") %>%
+      dplyr::select(ylddiff, phi, MG, GDD, fung)
+    ,
+    HQNF.shap %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "GDD") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "GDD") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(fung = "N") %>%
+      dplyr::select(ylddiff, phi, MG, GDD, fung)
+  )
+```
+
+### By foliar fungicide
+```{r shap_HQ_GDD_ff, eval=TRUE, echo=FALSE}
+# New facet label names for fung variable
+supp.labs <- c("Not Sprayed", "Sprayed")
+names(supp.labs) <- c("N", "Y")
+
+sh.x %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ fung, ncol = 1, labeller = labeller(fung = supp.labs)) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "GDD")
+```
+
+### By maturity group
+```{r shap_HQ_GDD_MG, eval=TRUE, echo=FALSE}
+sh.x %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ MG) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "GDD")
+```
+
+
+# Shapley values: doy
+* Represents planting date cast as `day-of-year` (from Jan 01st)
+
+## The highest-yielding fungicide-treated and untreated fields {.tabset .tabset-fade .tabset-pills}
+* These are the Shapley phi values associated with `doy` for this set of fields.
+```{r shap_HQ_doy_data, eval=TRUE, echo=FALSE}
+## Prep the data:
+# phi (doy), ylddiff, foliar fungicide, MG
+sh.x <-
+  dplyr::bind_rows(
+    HQF.shap %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "doy") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "doy") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=") %>%
+          as.numeric()})) %>%
+      dplyr::mutate(fung = "Y") %>%
+      dplyr::select(ylddiff, phi, MG, doy, fung)
+    ,
+    HQNF.shap %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "doy") %>%
+          dplyr::pull(phi)})) %>% 
+      dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "MG.f") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "doy") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=") %>%
+          as.numeric()})) %>%
+      dplyr::mutate(fung = "N") %>%
+      dplyr::select(ylddiff, phi, MG, doy, fung)
+  )
+```
+
+### By foliar fungicide
+```{r shap_HQ_doy_ff, eval=TRUE, echo=FALSE}
+# New facet label names for fung variable
+supp.labs <- c("Not Sprayed", "Sprayed")
+names(supp.labs) <- c("N", "Y")
+
+sh.x %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy)) +
+  geom_point() +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ fung, ncol = 1, labeller = labeller(fung = supp.labs)) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.5) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Day-of-year")
+```
+
+### By maturity group
+```{r shap_HQ_doy_MG, eval=TRUE, echo=FALSE}
+sh.x %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy)) +
+  geom_point() +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ MG) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.5) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Day-of-year")
+```
+
+
+# Shapley values: fungicides
+```{r Shapley_functions, eval=TRUE, echo=FALSE}
+shapr <- function(i, ss = 1000) {
+  # Get the Shapley value for an observation
+  # Args:
+  #  i = the sample id of the observation of interest
+  #  ss = The number of Monte Carlo samples for estimating the Shapley value
+  # Returns:
+  #  a list of: a data.frame of the shapley values, the actual prediction for the obs, the mean predicted yield
+  #
+  # Use a sample size of 1000 for more stable estimates:
+  shapley <- Shapley$new(imlpredobj, x.interest = x[i, ], sample.size = ss)
+  
+  return(list(
+  res = shapley$results,
+  # The actual prediction for the obs:
+  actual = shapley$y.hat.interest,
+  # The mean predicted yield over all obs:
+  mean = as.vector(shapley$y.hat.average)))
+} # end function shapr
+
+
+## speeding things up with furrr: does NOT work in this case, probably due to having used a custom predict function with iml to work with ranger, at least that's what I could discern from the error message.
+# system.time(
+# HYF.TED.303603 <- TEDHY.Fung.Data  %>%
+#   dplyr::filter(TED == 303603) %>%
+#   dplyr::select(sample_id) %>%
+#   dplyr::mutate(shap = furrr::future_map(sample_id, shapr, ss=10))
+# )
+
+
+shapEst <- function(data, .TED) {
+  # Get the Shapley values for the selected fields in a given TED
+  # Args:
+  #  data = tibble or data.frame of TED and the sample fields within each TED
+  #  .TED = numeric for the TED
+  # Returns:
+  # the Shapley values for each of the sampled fields
+  #
+  data  %>%
+  dplyr::filter(TED == .TED) %>%
+  dplyr::select(sample_id) %>%
+  dplyr::mutate(shap = purrr::map(sample_id, shapr))
+} # end function shapEst
+
+
+shapEstMG <- function(data, .MG) {
+  # Get the Shapley values for the selected fields in a given MG (maturity group)
+  # Args:
+  #  data = tibble or data.frame of MG and the sample fields within each MG
+  #  .MG = character string for the MG group
+  # Returns:
+  # the Shapley values for each of the sampled fields
+  #
+  data  %>%
+  dplyr::filter(MG.f == .MG) %>%
+  dplyr::select(sample_id) %>%
+  dplyr::mutate(shap = purrr::map(sample_id, shapr))
+} # end function shapEstMG
+
+
+shap.plot <- function(id, z) {
+  # Plots the Shapley values for a sampled field
+  # Args:
+  #   id = the field's sample id
+  #   z = the Shapley values list object returned by the shapr function
+  # Returns:
+  #   a ggplot of the Shapley values for the observation
+  #
+  res <- z %>% purrr::pluck(., "res")
+  actual <- z %>% purrr::pluck(., "actual")
+  mn <- z %>% purrr::pluck(., "mean")
+  
+  res %>%
+    dplyr::mutate(feature.value = forcats::fct_reorder(feature.value, phi)) %>%
+    dplyr::mutate(phi.c = ifelse(phi > 0, "H", "L")) %>%
+    dplyr::mutate(phi.c = factor(phi.c)) %>%
+    ggplot(., aes(x = phi, y = feature.value, colour = phi.c)) +
+    geom_point(show.legend = FALSE) +
+    ylab(NULL) +
+    xlab(paste("Obs: ", id)) +
+    ggtitle(sprintf("Actual prediction: %.2f\nAverage prediction: %.2f", actual, mn)) +
+    theme_bw() +
+    geom_vline(xintercept = 0, linetype = 2) +
+    theme(plot.title = element_text(size = 8, face = "bold"),
+          axis.text.y = element_text(size = 6),
+          axis.text.x = element_text(size = 8),
+          axis.title.x = element_text(size = 8, face = "bold"))
+  }  # end function shap.plot
+
+
+plotFeatureVals <- function(x, .TED, .slice) {
+  # Plot a grid of the feature values vs the Shapley phi for a specified set of fields in the TED
+  # Modeled after the lime plot_features output
+  # Args:
+  #  x = a list by TED of fitted Shapley values
+  #  .TED = character string for the TED of interest
+  #  .slice = 1:10 or 11:20 for the fields sampled in the TED
+  # Returns:
+  #  a grid of plots of the Shapley values for the sampled fields
+  #
+  z <- 
+    purrr::pluck(x, .TED) %>% 
+    dplyr::slice(.slice) %>%
+  # Add on the shapley plots:
+  dplyr::mutate(plt = purrr::map2(sample_id, shap, shap.plot))
+  
+  # And plot in a grid:
+  gridExtra::grid.arrange(grobs = z %>% purrr::pluck(., "plt"), ncol = 3,
+                          bottom = grid::textGrob("phi", gp = grid::gpar(fontsize = 12, fontface = "bold")),
+                          left = grid::textGrob("Feature value", rot = 90, gp = grid::gpar(fontsize = 12, 
+                                                                                           fontface = "bold")))
+}  # end function plotFeatureVals
+
+
+# this function was downloaded from the lime GitHub repo, needed for the heatmap function: theme_lime (I renamed it to theme_shap)
+# NOTE: was getting an error when knitr was compiling chunks which used this function. Apparently there is a conflict with randomForest package which also has a margin function, so need to specify that you are using margin from ggplot2:
+# https://github.com/tidyverse/ggplot2/issues/2150
+theme_shap <- function(...) {
+  theme_minimal() +
+    theme(
+      strip.text = element_text(face = 'bold', size = 9),
+      plot.margin = ggplot2::margin(15, 15, 15, 15),
+      legend.background = element_blank(),
+      legend.key = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      axis.ticks = element_blank(),
+      legend.position = 'bottom',
+      panel.spacing.y = unit(15, 'pt'),
+      strip.text.x = element_text(margin = ggplot2::margin(t = 2, b = 2), hjust = 0),
+      axis.title.y = element_text(margin = ggplot2::margin(r = 10)),
+      axis.title.x = element_text(margin = ggplot2::margin(t = 10)),
+      ...
+    )
+}  # end function theme_shap
+
+
+shap.heat <- function(.obj, .TED) {
+  # Plots a heatmap of the Shapley phi values
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for the sampled fields in a TED, e.g. 
+  #  Top 12 TEDs, fungicide-treated, 20 best-yielding fields 
+  #  .TED = character string for the TED
+  # Returns:
+  #  a heatmap plot of the Shapley phi values
+  #
+  # Extract the Shapley values for fields in the selected TED
+  z <- 
+  .obj %>%
+  purrr::pluck(., .TED) %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, everything())})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  purrr::map_dfr(., bind_rows)
+  
+  num_cases <- unique(as.numeric(z$id))
+  z$id <- factor(z$id, levels = as.character(sort(num_cases)))
+  
+  z$feature.value <- factor(
+    z$feature.value,
+    levels = rev(unique(z$feature.value[order(z$feature, z$phi)]))
+  )
+  
+  # plot the heatmap:
+  ggplot(z, aes(id, feature.value)) +
+    geom_tile(aes(fill = phi)) +
+    scale_x_discrete('Case', expand = c(0, 0)) +
+    scale_y_discrete('Feature', expand = c(0, 0)) +
+    # The next line is the color scheme that appeared in the GitHub code:
+    # scale_fill_gradient2('Feature\nweight', low = 'firebrick', mid = '#f7f7f7', high = 'steelblue') +
+    scale_fill_gradient2('Shapley\nphi', low = "#8e0152", mid = "#f7f7f7", high = "#276419") +
+    theme_shap() +
+    theme(panel.border = element_rect(fill = NA, colour = 'grey60', size = 1),
+          panel.grid = element_blank(),
+          legend.position = 'right',
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          axis.text.y = element_text(size = 5))
+}  # end function shap.heat
+
+
+shapFeatureDescTable <- function(.obj, .TED) {
+  # Table the number of times a feature description appeared in an explanation over the number of fields 
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each TED
+  #  .TED = character string for the TED
+  #
+  # Returns:
+  # a kable-styled table of the feature, feature description, the number of times the description appeared and the total number of fields in the local observation set
+  #
+  #
+  # No. of cases (fields) sampled from the TED:
+  no.cases <- .obj %>% purrr::pluck(., .TED, "sample_id") %>% unique(.) %>% length(.)
+  
+  # Get the feature.value and no. times it appeared among the sampled fields
+  .obj %>%
+  purrr::pluck(., .TED) %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, feature, feature.value)})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  purrr::map_dfr(., bind_rows) %>%
+  dplyr::group_by(feature) %>%  
+  dplyr::count(feature.value) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lccc", col.names = c("Feature", "Feature description", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+    scroll_box(width = "500px", height = "400px")
+  }  # end function shapFeatureDescTable
+
+
+mypalette <- RColorBrewer::brewer.pal(3, "Set1")
+
+phi.yld <- function(.obj, .TED, ly, uy, lx, ux)   {
+  # Plots the Shapley phi values vs the yield difference for the fungicides feature
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each TED
+  #  .TED = character string for the TED
+  #
+  # Returns:
+  # a ggplot of the data
+  #
+  .obj %>% 
+  purrr::pluck(., .TED) %>%
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>%
+  dplyr::mutate(phi.c = ifelse(phi > 0, "H", "L")) %>%
+  dplyr::mutate(phi.c = factor(phi.c, levels = c("H", "L"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = phi.c)) +
+  geom_point(show.legend = FALSE) +
+  scale_colour_manual(values = mypalette, drop = FALSE) +
+  theme_bw() +
+  ylim(ly, uy) +
+  xlim(lx, ux) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+}  # end function phi.yld
+
+
+rngf <- function(z, obj) {
+  # Get the min and max values for predicted yield and the Shapley values for all sampled fields across all TEDs in a set e.g. HYF.shap
+  # Args:
+  #  z = numeric vector corresponding to the number of TEDs in the Shapley values object (typically 12 TEDs)
+  #  obj = the list objects containing the Shapley values for the sampled fields within each TED
+  # Returns:
+  # a 1x4 tibble with min and max yield and phi
+  #
+  purrr::map_dfr(z, function(i) {obj %>% 
+  purrr::pluck(., i) %>%
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>%
+  dplyr::summarise(min.ylddiff = min(ylddiff), max.ylddiff = max(ylddiff), min.phi = min(phi), max.phi = max(phi))}
+) %>%
+  dplyr::summarise(minyld = min(min.ylddiff), maxyld = max(max.ylddiff), minphi = min(min.phi), maxphi = max(max.phi))
+}  # end function rngf
+```
+
+
+```{r Shapley_Setup, eval=FALSE, echo=FALSE}
+## Top 12 TEDs: fungicide-treated: 20 best-yielding fields
+HYF.Data <- purrr::map_dfr(sort(top.12.TEDs), TEDHYPredData, x = 20, fung = "yes") %>% dplyr::select(TED, sample_id)
+
+# This give a named list (https://stackoverflow.com/questions/43935160/use-input-of-purrrs-map-function-to-create-a-named-list-as-output-in-r):
+HYF.shap <- as.list(sort(top.12.TEDs)) %>% set_names() %>% purrr::map(., shapEst, data = HYF.Data)
+
+# and then you can extract the individual tibbles like this:
+# purrr::pluck(HYF.shap, "303603")
+# purrr::pluck(HYF.shap, "303703")
+
+
+## Top TEDs: fungicide-treated: 20 worst-yielding fields
+# Can do only for TEDs: 504803, 603503, 603603, 603703, 604603, 604803:
+LYF.Data <- purrr::map_dfr(c(504803, 603503, 603603, 603703, 604603, 604803), TEDLYPredData, x = 20, fung = "yes") %>% dplyr::select(TED, sample_id)
+
+LYF.shap <- list(504803, 603503, 603603, 603703, 604603, 604803) %>% set_names() %>% purrr::map(., shapEst, data = LYF.Data)
+
+
+## Top 12 TEDs: no fungicides applied: 20 best-yielding fields
+HYNF.Data <- purrr::map_dfr(sort(top.12.TEDs), TEDHYPredData, x = 20, fung = "no") %>% dplyr::select(TED, sample_id)
+
+HYNF.shap <- as.list(sort(top.12.TEDs)) %>% set_names() %>% purrr::map(., shapEst, data = HYNF.Data)
+
+
+## Top 12 TEDs: no fungicides applied: 20 worst-yielding fields
+LYNF.Data <- purrr::map_dfr(sort(top.12.TEDs), TEDLYPredData, x = 20, fung = "no")  %>% dplyr::select(TED, sample_id)
+
+LYNF.shap <- as.list(sort(top.12.TEDs)) %>% set_names() %>% purrr::map(., shapEst, data = LYNF.Data)
+
+
+
+## All TEDs: fungicide-treated: 100 best-yielding fields
+AllHYF.shap <- AllTEDHYPredData(x = 100, fung = "yes") %>% 
+  dplyr::select(sample_id) %>% 
+  dplyr::mutate(shap = map(sample_id, shapr))
+  
+## All TEDs: fungicide-treated: 100 worst-yielding fields
+AllLYF.shap <- AllTEDLYPredData(x = 100, fung = "yes") %>%
+  dplyr::select(sample_id) %>% 
+  dplyr::mutate(shap = map(sample_id, shapr))
+  
+## All TEDs: no fungicide: 100 best-yielding fields
+AllHYNF.shap <- AllTEDHYPredData(x = 100, fung = "no") %>% 
+  dplyr::select(sample_id) %>% 
+  dplyr::mutate(shap = map(sample_id, shapr))
+
+## All TEDs: no fungicide: 100 worst-yielding fields
+AllLYNF.shap <- AllTEDLYPredData(x = 100, fung = "no") %>% 
+  dplyr::select(sample_id) %>% 
+  dplyr::mutate(shap = map(sample_id, shapr))
+  
+
+
+## A focus on the highest-yielding fields
+# foliar fungicides applied:
+HQF.shap <- 
+  dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  dplyr::filter(foliar.fungicide == "yes") %>%
+  dplyr::select(sample_id) %>% 
+  dplyr::mutate(shap = map(sample_id, shapr))
+
+# no foliar fungicides used:
+HQNF.shap <- 
+  dat %>%
+  dplyr::mutate(sample_id = 1:nrow(.)) %>%
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  dplyr::filter(foliar.fungicide == "no") %>%
+  dplyr::select(sample_id) %>% 
+  dplyr::mutate(shap = map(sample_id, shapr))
+  
+
+
+## By Maturity group
+## Look at the top 50 highest-yielding fungicide-treated fields and non-treated fields in each maturity group.
+### Fungicides applied
+MGHYF.Data <- purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHYPredData, x = 50, fung = "yes") %>%
+  dplyr::select(MG.f, sample_id)
+
+MGHYF.shap <- list("0", "I", "II", "III", "IV") %>% set_names() %>% purrr::map(., shapEstMG, data = MGHYF.Data)
+
+### Fungicides not applied
+MGHYNF.Data <- purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHYPredData, x = 50, fung = "no") %>%
+  dplyr::select(MG.f, sample_id)
+
+MGHYNF.shap <- list("0", "I", "II", "III", "IV") %>% set_names() %>% purrr::map(., shapEstMG, data = MGHYNF.Data)
+
+# Once you have all the objects, save them. Some will be quite large:
+save(HYF.shap, LYF.shap, HYNF.shap, LYNF.shap, AllHYF.shap, AllLYF.shap, AllHYNF.shap, AllLYNF.shap, HQF.shap, HQNF.shap, MGHYF.shap, MGHYNF.shap, file = "ShapFits.RData")
+```
+
+
+## Top 12 TEDs: fungicide-treated: 20 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r shap_TEDHYF_fieldlocs, eval=TRUE, echo=FALSE}
+TEDHYFung <- purrr::map_dfr(c(303603, 303703, 403603, 403703, 504803, 602303, 603503, 603603, 603703, 604503, 604603, 604803), TEDHY, x = 20, fung = "yes")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDHYFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, foliar fungicides used, 20 highest-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_TEDHYF_yldphi_range, eval=FALSE, echo=FALSE}
+# I use this to get an idea of the limits to set for consistent display of the phi vs yield difference graph. Want the same axis limits across all the TEDs 
+rngf(z = 1:12, obj = HYF.shap)
+```
+
+
+### TED 303603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_303603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "303603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_303603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "303603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_Exploration_Setup, eval=FALSE, echo=FALSE}
+## GOAL: create a heatmap of the Shapley phi values, akin to the heatmap produced by lime.
+
+# For a given TED, this lists the fields and the shapley data:
+purrr::pluck(HYF.shap, "303603") 
+
+# For the first field in the selected TED, we can pull out the field id and shapley values data into a tibble like this:
+purrr::pluck(HYF.shap, "303603", "shap", 1, "res") %>%
+  dplyr::mutate(id = purrr::pluck(HYF.shap, "303603", "sample_id", 1)) %>%
+  dplyr::select(id, everything())
+
+# Now would like to map over all the sample fields in the TED, put it all in a tibble:
+tst <- 
+  HYF.shap %>%
+  purrr::pluck(., "303603") %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, everything())})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  map_dfr(., bind_rows)
+
+# Take a look:
+tst %>% head()
+
+# The next set of lines follows the plot_explanations code at the lime GitHub site (https://github.com/thomasp85/lime/blob/master/R/plot.R). NOTE: need the theme_lime function! I won't edit it; it's more complicated than I'm used to.
+theme_lime <- function(...) {
+  theme_minimal() +
+    theme(
+      strip.text = element_text(face = 'bold', size = 9),
+      plot.margin = margin(15, 15, 15, 15),
+      legend.background = element_blank(),
+      legend.key = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      axis.ticks = element_blank(),
+      legend.position = 'bottom',
+      panel.spacing.y = unit(15, 'pt'),
+      strip.text.x = element_text(margin = margin(t = 2, b = 2), hjust = 0),
+      axis.title.y = element_text(margin = margin(r = 10)),
+      axis.title.x = element_text(margin = margin(t = 10)),
+      ...
+    )
+}
+
+num_cases <- unique(as.numeric(tst$id))
+tst$id <- factor(tst$id, levels = as.character(sort(num_cases)))
+
+tst$feature.value <- factor(
+    tst$feature.value,
+    levels = rev(unique(tst$feature.value[order(tst$feature, tst$phi)]))
+  )
+
+# and now can plot as a heatmap:
+ggplot(tst, aes(id, feature.value)) +
+    geom_tile(aes(fill = phi)) +
+    scale_x_discrete('Case', expand = c(0, 0)) +
+    scale_y_discrete('Feature', expand = c(0, 0)) +
+    # scale_fill_gradient2('Feature\nweight', low = 'firebrick', mid = '#f7f7f7', high = 'steelblue') +
+  scale_fill_gradient2('Shapley\nphi', low = "#8e0152", mid = "#f7f7f7", high = "#276419") +
+  theme_lime() +
+  theme(panel.border = element_rect(fill = NA, colour = 'grey60', size = 1),
+        panel.grid = element_blank(),
+        legend.position = 'right',
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.text.y = element_text(size = 5))
+
+
+# NEXT: throw all this into a function!
+shap.heat <- function(.obj, .TED) {
+  # Plots a heatmap of the Shapley phi values
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for the sampled fields in a TED, e.g. 
+  #  Top 12 TEDs, fungicide-treated, 20 best-yielding fields 
+  #  .TED = character string for the TED
+  # Returns:
+  #
+  # Extract the Shapley values for fields in the selected TED
+  z <- 
+  .obj %>%
+  purrr::pluck(., .TED) %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, everything())})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  map_dfr(., bind_rows)
+  
+  num_cases <- unique(as.numeric(z$id))
+  z$id <- factor(z$id, levels = as.character(sort(num_cases)))
+  
+  z$feature.value <- factor(
+    z$feature.value,
+    levels = rev(unique(z$feature.value[order(z$feature, z$phi)]))
+  )
+  
+  # plot the heatmap:
+  ggplot(z, aes(id, feature.value)) +
+    geom_tile(aes(fill = phi)) +
+    scale_x_discrete('Case', expand = c(0, 0)) +
+    scale_y_discrete('Feature', expand = c(0, 0)) +
+    # scale_fill_gradient2('Feature\nweight', low = 'firebrick', mid = '#f7f7f7', high = 'steelblue') +
+    scale_fill_gradient2('Shapley\nphi', low = "#8e0152", mid = "#f7f7f7", high = "#276419") +
+    theme_lime() +
+    theme(panel.border = element_rect(fill = NA, colour = 'grey60', size = 1),
+          panel.grid = element_blank(),
+          legend.position = 'right',
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          axis.text.y = element_text(size = 5))
+}
+
+# It works:
+shap.heat(.obj=HYF.shap, .TED="303603")
+```
+
+```{r shap_HM_HYF_TED_303603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "303603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_303603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "303603")
+```
+
+#### Fungicide: phi vs yield difference
+* for the foliar fungicide feature, plot the estimated Shapley phi value versus the difference in the predicted yield for the field and the overall mean predicted yield. 
+* e.g. a high-yielding, sprayed field would have a predicted yield above the overall predicted average. We want to visualize how much of the difference is contributed by the foliar fungicide.
+```{r shap_phiyld_HYF_TED_303603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "303603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 303703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_303703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "303703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_303703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "303703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_303703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "303703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_303703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "303703")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_303703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "303703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_403603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "403603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_403603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "403603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_403603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "403603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_403603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "403603")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_403603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "403603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_403703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "403703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_403703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "403703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_403703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "403703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_403703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "403703")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_403703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "403703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "504803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "504803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_504803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "504803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_504803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "504803")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_504803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "504803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 602303 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_602303_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "602303", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_602303_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "602303", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_602303, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "602303")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_602303, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "602303")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_602303, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "602303", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "603503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "603503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_603503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "603503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_603503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "603503")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_603503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "603503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "603603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "603603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_603603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "603603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_603603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "603603")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_603603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "603603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "603703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "603703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_603703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "603703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_603703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "603703")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_603703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "603703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_604503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "604503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_604503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "604503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_604503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "604503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_604503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "604503")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_604503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "604503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "604603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "604603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_604603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "604603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_604603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "604603")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_604603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "604603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "604803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYF.shap, .TED = "604803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYF_TED_604803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYF.shap, .TED = "604803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYF_TED_604803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYF.shap, .TED = "604803")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HYF_TED_604803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYF.shap, .TED = "604803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+## Top TEDs: fungicide-treated: 20 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+
+*  Can do only for TEDs: 504803, 603503, 603603, 603703, 604603, 604803.
+*  Because need TEDs with 40 or more fungicide-treated fields to group into high-yield and low-yield fields (where fungicides were applied)
+
+### The field locations
+```{r shap_TEDLYF_fieldlocs, eval=TRUE, echo=FALSE}
+TEDLYFung <- purrr::map_dfr(c(504803, 603503, 603603, 603703, 604603, 604803), TEDLY, x = 20, fung = "yes")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDLYFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top TEDs, foliar fungicides used, 20 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_TEDLYF_yldphi_range, eval=FALSE, echo=FALSE}
+rngf(z = 1:6, obj = LYF.shap)
+```
+
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "504803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "504803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYF_TED_504803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYF.shap, .TED = "504803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYF_TED_504803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYF.shap, .TED = "504803")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_LYF_TED_504803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYF.shap, .TED = "504803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "603503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "603503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYF_TED_603503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYF.shap, .TED = "603503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYF_TED_603503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYF.shap, .TED = "603503")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_LYF_TED_603503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYF.shap, .TED = "603503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "603603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "603603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYF_TED_603603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYF.shap, .TED = "603603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYF_TED_603603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYF.shap, .TED = "603603")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_LYF_TED_603603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYF.shap, .TED = "603603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "603703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "603703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYF_TED_603703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYF.shap, .TED = "603703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYF_TED_603703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYF.shap, .TED = "603703")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_LYF_TED_603703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYF.shap, .TED = "603703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "604603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "604603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYF_TED_604603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYF.shap, .TED = "604603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYF_TED_604603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYF.shap, .TED = "604603")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_LYF_TED_604603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYF.shap, .TED = "604603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "604803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYF.shap, .TED = "604803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYF_TED_604803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYF.shap, .TED = "604803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYF_TED_604803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYF.shap, .TED = "604803")
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_LYF_TED_604803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYF.shap, .TED = "604803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+## Top 12 TEDs: no fungicides applied: 20 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r shap_TEDHYNF_fieldlocs, eval=TRUE, echo=FALSE}
+TEDHYNFung <- purrr::map_dfr(c(303603, 303703, 403603, 403703, 504803, 602303, 603503, 603603, 603703, 604503, 604603, 604803), TEDHY, x = 20, fung = "no")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDHYNFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, no foliar fungicides used, 20 highest-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_TEDHYNF_yldphi_range, eval=FALSE, echo=FALSE}
+rngf(z = 1:12, obj = HYNF.shap)
+```
+
+
+### TED 303603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_303603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "303603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_303603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "303603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_303603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "303603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_303603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "303603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_303603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "303603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 303703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_303703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "303703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_303703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "303703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_303703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "303703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_303703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "303703")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_303703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "303703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_403603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "403603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_403603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "403603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_403603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "403603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_403603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "403603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_403603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "403603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_403703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "403703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_403703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "403703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_403703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "403703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_403703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "403703")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_403703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "403703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "504803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "504803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_504803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "504803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_504803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "504803")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_504803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "504803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 602303 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_602303_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "602303", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_602303_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "602303", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_602303, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "602303")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_602303, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "602303")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_602303, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "602303", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "603503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "603503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_603503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "603503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_603503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "603503")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_603503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "603503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "603603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "603603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_603603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "603603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_603603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "603603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_603603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "603603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "603703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "603703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_603703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "603703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_603703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "603703")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_603703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "603703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_604503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "604503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_604503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "604503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_604503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "604503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_604503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "604503")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_604503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "604503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "604603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "604603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_604603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "604603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_604603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "604603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_604603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "604603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotHYNF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "604803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotHYNF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = HYNF.shap, .TED = "604803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_HYNF_TED_604803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = HYNF.shap, .TED = "604803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HYNF_TED_604803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = HYNF.shap, .TED = "604803")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HYNF_TED_604803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = HYNF.shap, .TED = "604803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+## Top 12 TEDs: no fungicides applied: 20 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r shap_TEDLYNF_fieldlocs, eval=TRUE, echo=FALSE}
+TEDLYNFung <- purrr::map_dfr(sort(top.12.TEDs), TEDLY, x = 20, fung = "no")
+
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = TEDLYNFung, 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  facet_wrap(~ TED) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Top 12 TEDs, no foliar fungicides used, 20 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_TEDLYNF_yldphi_range, eval=FALSE, echo=FALSE}
+rngf(z = 1:12, obj = LYNF.shap)
+```
+
+
+### TED 303603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_303603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "303603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_303603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "303603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_303603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "303603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_303603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "303603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_303603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "303603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 303703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_303703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "303703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_303703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "303703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_303703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "303703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_303703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "303703")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_303703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "303703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_403603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "403603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_403603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "403603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_403603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "403603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_403603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "403603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_403603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "403603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 403703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_403703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "403703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_403703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "403703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_403703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "403703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_403703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "403703")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_403703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "403703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 504803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_504803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "504803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_504803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "504803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_504803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "504803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_504803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "504803")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_504803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "504803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 602303 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_602303_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "602303", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_602303_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "602303", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_602303, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "602303")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_602303, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "602303")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_602303, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "602303", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_603503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "603503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_603503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "603503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_603503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "603503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_603503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "603503")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_603503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "603503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_603603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "603603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_603603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "603603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_603603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "603603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_603603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "603603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_603603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "603603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 603703 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_603703_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "603703", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_603703_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "603703", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_603703, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "603703")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_603703, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "603703")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_603703, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "603703", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604503 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_604503_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "604503", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_604503_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "604503", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_604503, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "604503")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_604503, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "604503")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_604503, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "604503", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604603 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_604603_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "604603", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_604603_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "604603", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_604603, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "604603")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_604603, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "604603")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_604603, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "604603", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+### TED 604803 {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotLYNF_TED_604803_I, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "604803", .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotLYNF_TED_604803_II, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+plotFeatureVals(x = LYNF.shap, .TED = "604803", .slice = 11:20)
+```
+
+#### Heatmap
+```{r shap_HM_LYNF_TED_604803, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=8.0}
+shap.heat(.obj = LYNF.shap, .TED = "604803")
+```
+
+#### Description Table
+```{r shap_FeatureDesc_LYNF_TED_604803, eval=TRUE, echo=FALSE}
+shapFeatureDescTable(.obj = LYNF.shap, .TED = "604803")
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_LYNF_TED_604803, eval=TRUE, echo=FALSE}
+phi.yld(.obj = LYNF.shap, .TED = "604803", ly = -3.0, uy = 6.0, lx = -40, ux = 35)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+## All TEDs: fungicide-treated: 100 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+
+```{r shap_All_functions, eval=TRUE, echo=FALSE}
+AllplotFeatureVals <- function(x, .slice) {
+  # Plot a grid of the feature values vs the Shapley phi for a specified set of fields
+  # Modeled after the lime plot_features output
+  # Args:
+  #  x = a tibble of the `All` series of fitted Shapley values
+  #  .slice = e.g., 1:10 or 11:20 for the fields
+  # Returns:
+  #  a grid of plots of the Shapley values for the sampled fields
+  #
+  z <- 
+    x %>% 
+    dplyr::slice(.slice) %>%
+  # Add on the shapley plots:
+  dplyr::mutate(plt = purrr::map2(sample_id, shap, shap.plot))
+  
+  # And plot in a grid:
+  gridExtra::grid.arrange(grobs = z %>% purrr::pluck(., "plt"), ncol = 3,
+                          bottom = grid::textGrob("phi", gp = grid::gpar(fontsize = 12, fontface = "bold")),
+                          left = grid::textGrob("Feature value", rot = 90, gp = grid::gpar(fontsize = 12, 
+                                                                                           fontface = "bold")))
+}  # end function AllplotFeatureVals
+
+# Example of use:
+# AllplotFeatureVals(AllHYF.shap, 1:10)
+
+
+Allshap.heat <- function(.obj, .slice) {
+  # Plots a heatmap of the Shapley phi values
+  # Args:
+  #  .obj = a tibble with the Shapley values for the sampled fields, from the `All` series
+  #  .slice = e.g., 1:10 or 11:20 for the fields (visualizing 100 fields at same time too cluttered)
+  # Returns:
+  #  a heatmap plot of the Shapley phi values
+  #
+  # Extract the Shapley values for fields:
+  z <- 
+  .obj %>%
+  dplyr::slice(.slice) %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, everything())})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  purrr::map_dfr(., bind_rows)
+  
+  num_cases <- unique(as.numeric(z$id))
+  z$id <- factor(z$id, levels = as.character(sort(num_cases)))
+  
+  z$feature.value <- factor(
+    z$feature.value,
+    levels = rev(unique(z$feature.value[order(z$feature, z$phi)]))
+  )
+  
+  # plot the heatmap:
+  ggplot(z, aes(id, feature.value)) +
+    geom_tile(aes(fill = phi)) +
+    scale_x_discrete('Case', expand = c(0, 0)) +
+    scale_y_discrete('Feature', expand = c(0, 0)) +
+    # The next line is the color scheme that appeared in the GitHub code:
+    # scale_fill_gradient2('Feature\nweight', low = 'firebrick', mid = '#f7f7f7', high = 'steelblue') +
+    scale_fill_gradient2('Shapley\nphi', low = "#8e0152", mid = "#f7f7f7", high = "#276419") +
+    theme_shap() +
+    theme(panel.border = element_rect(fill = NA, colour = 'grey60', size = 1),
+          panel.grid = element_blank(),
+          legend.position = 'right',
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          axis.text.y = element_text(size = 5))
+}  # end function Allshap.heat
+
+# Example of use:
+# Allshap.heat(.obj = AllHYF.shap, .slice = 1:20)
+
+
+AllshapFeatureDescTable <- function(.obj) {
+  # Table the number of times a feature description appeared in an explanation over the number of fields 
+  # Args:
+  #  .obj = a tibble with the Shapley values for each field in the `All` series
+  #
+  # Returns:
+  # a kable-styled table of the feature, feature description, the number of times the description appeared and the total number of fields in the local observation set
+  #
+  #
+  # No. of cases (fields) sampled:
+  no.cases <- .obj %>% purrr::pluck(., "sample_id") %>% unique(.) %>% length(.)
+  
+  # Get the feature.value and no. times it appeared among the sampled fields
+  .obj %>%
+    dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+        dplyr::mutate(id = .x) %>% 
+        dplyr::select(id, feature, feature.value)})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  purrr::map_dfr(., bind_rows) %>%
+  dplyr::group_by(feature) %>%  
+  dplyr::count(feature.value) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lccc", col.names = c("Feature", "Feature description", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+    scroll_box(width = "500px", height = "400px")
+  }  # end function AllshapFeatureDescTable
+
+# Example of use:
+# AllshapFeatureDescTable(.obj = AllHYF.shap)
+
+
+Allrngf <- function(.obj) {
+  # Get the min and max values for predicted yield and the Shapley values for all sampled fields in a set e.g. AllHYF.shap
+  # Args:
+  #  .obj = the tibble (of the `All` series) containing the Shapley values for the sampled fields
+  # Returns:
+  # a 1x4 tibble with min and max yield and phi
+  #
+  .obj %>%
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>%
+    dplyr::summarise(min.ylddiff = min(ylddiff), max.ylddiff = max(ylddiff), min.phi = min(phi), max.phi = max(phi)) 
+}  # end function Allrngf
+
+# Example of use:
+# Allrngf(.obj = AllHYF.shap) 
+
+Allphi.yld <- function(.obj, ly, uy, lx, ux)   {
+  # Plots the Shapley phi values vs the yield difference for the fungicides feature
+  # Args:
+  #  .obj = a tibble from the `All` series with the Shapley values for each field
+  #
+  # Returns:
+  # a ggplot of the data
+  #
+  .obj %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>%
+  dplyr::mutate(phi.c = ifelse(phi > 0, "H", "L")) %>%
+  dplyr::mutate(phi.c = factor(phi.c, levels = c("H", "L"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = phi.c)) +
+  geom_point(show.legend = FALSE) +
+  scale_colour_manual(values = mypalette, drop = FALSE) +
+  theme_bw() +
+  ylim(ly, uy) +
+  xlim(lx, ux) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+}  # end function Allphi.yld
+
+# Example of use:
+# Allphi.yld(.obj = AllHYF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+### The field locations
+```{r shap_AllTEDHYF, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDHY(x = 100, fung = "yes"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, foliar fungicides applied, 100 best-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_ALLHYF_yldphi_range, eval=FALSE, echo=FALSE}
+Allrngf(.obj = AllHYF.shap) 
+```
+
+
+### Predicted yield summary
+```{r shap_TableAllHYF, eval=TRUE, echo=FALSE}
+AllHYF.shap %>%  
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::summarise(n = n(), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+### Feature values {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotAllHYF_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotAllHYF_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 11:20)
+```
+
+#### Fields 21:30
+```{r shap_plotAllHYF_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 21:30)
+```
+
+#### Fields 31:40
+```{r shap_plotAllHYF_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 31:40)
+```
+
+#### Fields 41:50
+```{r shap_plotAllHYF_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 41:50)
+```
+
+#### Fields 51:60
+```{r shap_plotAllHYF_51_to_60, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 51:60)
+```
+
+#### Fields 61:70
+```{r shap_plotAllHYF_61_to_70, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 61:70)
+```
+
+#### Fields 71:80
+```{r shap_plotAllHYF_71_to_80, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 71:80)
+```
+
+#### Fields 81:90
+```{r shap_plotAllHYF_81_to_90, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 81:90)
+```
+
+#### Fields 91:100
+```{r shap_plotAllHYF_91_to_100, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYF.shap, .slice = 91:100)
+```
+
+### Heatmap {.tabset .tabset-fade .tabset-pills}
+#### Fields 1 to 50
+```{r shap_HM_AllHYF_1_to_50, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllHYF.shap, .slice = 1:50)
+```
+
+#### Fields 51 to 100
+```{r shap_HM_AllHYF_51_to_100, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllHYF.shap, .slice = 51:100)
+```
+
+### Description Table
+```{r shap_FeatureDesc_AllHYF, eval=TRUE, echo=FALSE}
+AllshapFeatureDescTable(.obj = AllHYF.shap)
+```
+
+### Fungicide: phi vs yield difference
+* notice the one outlier
+```{r shap_phiyld_AllHYF, eval=TRUE, echo=FALSE}
+Allphi.yld(.obj = AllHYF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+## All TEDs: fungicide-treated: 100 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+
+### The field locations
+```{r shap_AllTEDLYF, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDLY(x = 100, fung = "yes"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, foliar fungicides applied, 100 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_ALLLYF_yldphi_range, eval=FALSE, echo=FALSE}
+Allrngf(.obj = AllLYF.shap) 
+```
+
+
+### Predicted yield summary
+```{r shap_TableAllLYF, eval=TRUE, echo=FALSE}
+AllLYF.shap %>%  
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::summarise(n = n(), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+### Feature values {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotAllLYF_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotAllLYF_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 11:20)
+```
+
+#### Fields 21:30
+```{r shap_plotAllLYF_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 21:30)
+```
+
+#### Fields 31:40
+```{r shap_plotAllLYF_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 31:40)
+```
+
+#### Fields 41:50
+```{r shap_plotAllLYF_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 41:50)
+```
+
+#### Fields 51:60
+```{r shap_plotAllLYF_51_to_60, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 51:60)
+```
+
+#### Fields 61:70
+```{r shap_plotAllLYF_61_to_70, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 61:70)
+```
+
+#### Fields 71:80
+```{r shap_plotAllLYF_71_to_80, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 71:80)
+```
+
+#### Fields 81:90
+```{r shap_plotAllLYF_81_to_90, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 81:90)
+```
+
+#### Fields 91:100
+```{r shap_plotAllLYF_91_to_100, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYF.shap, .slice = 91:100)
+```
+
+### Heatmap {.tabset .tabset-fade .tabset-pills}
+#### Fields 1 to 50
+```{r shap_HM_AllLYF_1_to_50, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllLYF.shap, .slice = 1:50)
+```
+
+#### Fields 51 to 100
+```{r shap_HM_AllLYF_51_to_100, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllLYF.shap, .slice = 51:100)
+```
+
+### Description Table
+```{r shap_FeatureDesc_AllLYF, eval=TRUE, echo=FALSE}
+AllshapFeatureDescTable(.obj = AllLYF.shap)
+```
+
+### Fungicide: phi vs yield difference
+```{r shap_phiyld_AllLYF, eval=TRUE, echo=FALSE}
+Allphi.yld(.obj = AllLYF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+## All TEDs: no fungicide: 100 best-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r shap_AllTEDHYNF, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDHY(x = 100, fung = "no"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, no foliar fungicides, 100 best-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_ALLHYNF_yldphi_range, eval=FALSE, echo=FALSE}
+Allrngf(.obj = AllHYNF.shap) 
+```
+
+
+### Predicted yield summary
+```{r shap_TableAllHYNF, eval=TRUE, echo=FALSE}
+AllHYNF.shap %>%  
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::summarise(n = n(), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+### Feature values {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotAllHYNF_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotAllHYNF_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 11:20)
+```
+
+#### Fields 21:30
+```{r shap_plotAllHYNF_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 21:30)
+```
+
+#### Fields 31:40
+```{r shap_plotAllHYNF_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 31:40)
+```
+
+#### Fields 41:50
+```{r shap_plotAllHYNF_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 41:50)
+```
+
+#### Fields 51:60
+```{r shap_plotAllHYNF_51_to_60, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 51:60)
+```
+
+#### Fields 61:70
+```{r shap_plotAllHYNF_61_to_70, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 61:70)
+```
+
+#### Fields 71:80
+```{r shap_plotAllHYNF_71_to_80, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 71:80)
+```
+
+#### Fields 81:90
+```{r shap_plotAllHYNF_81_to_90, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 81:90)
+```
+
+#### Fields 91:100
+```{r shap_plotAllHYNF_91_to_100, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllHYNF.shap, .slice = 91:100)
+```
+
+### Heatmap {.tabset .tabset-fade .tabset-pills}
+#### Fields 1 to 50
+```{r shap_HM_AllHYNF_1_to_50, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllHYNF.shap, .slice = 1:50)
+```
+
+#### Fields 51 to 100
+```{r shap_HM_AllHYNF_51_to_100, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllHYNF.shap, .slice = 51:100)
+```
+
+### Description Table
+```{r shap_FeatureDesc_AllHYNF, eval=TRUE, echo=FALSE}
+AllshapFeatureDescTable(.obj = AllHYNF.shap)
+```
+
+### No fungicide: phi vs yield difference
+```{r shap_phiyld_AllHYNF, eval=TRUE, echo=FALSE}
+Allphi.yld(.obj = AllHYNF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+## All TEDs: no fungicide: 100 worst-yielding fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r shap_AllTEDLYNF, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = AllTEDLY(x = 100, fung = "no"), 
+             aes(x = longitude, y = latitude, colour = factor(year)), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  # facet_wrap(~ TED, ncol = 6) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Year", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("All TEDs, no foliar fungicides, 100 worst-yielding fields") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+```{r shap_ALLLYNF_yldphi_range, eval=FALSE, echo=FALSE}
+Allrngf(.obj = AllLYNF.shap) 
+```
+
+
+### Predicted yield summary
+```{r shap_TableAllLYNF, eval=TRUE, echo=FALSE}
+AllLYNF.shap %>%  
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::summarise(n = n(), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  knitr::kable(., row.names = FALSE, align = "ccc", col.names = c("No. of fields", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+### Feature values {.tabset .tabset-fade .tabset-pills}
+#### Fields 1:10
+```{r shap_plotAllLYNF_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 1:10)
+```
+
+#### Fields 11:20
+```{r shap_plotAllLYNF_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 11:20)
+```
+
+#### Fields 21:30
+```{r shap_plotAllLYNF_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 21:30)
+```
+
+#### Fields 31:40
+```{r shap_plotAllLYNF_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 31:40)
+```
+
+#### Fields 41:50
+```{r shap_plotAllLYNF_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 41:50)
+```
+
+#### Fields 51:60
+```{r shap_plotAllLYNF_51_to_60, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 51:60)
+```
+
+#### Fields 61:70
+```{r shap_plotAllLYNF_61_to_70, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 61:70)
+```
+
+#### Fields 71:80
+```{r shap_plotAllLYNF_71_to_80, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 71:80)
+```
+
+#### Fields 81:90
+```{r shap_plotAllLYNF_81_to_90, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 81:90)
+```
+
+#### Fields 91:100
+```{r shap_plotAllLYNF_91_to_100, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = AllLYNF.shap, .slice = 91:100)
+```
+
+### Heatmap {.tabset .tabset-fade .tabset-pills}
+#### Fields 1 to 50
+```{r shap_HM_AllLYNF_1_to_50, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllLYNF.shap, .slice = 1:50)
+```
+
+#### Fields 51 to 100
+```{r shap_HM_AllLYNF_51_to_100, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = AllLYNF.shap, .slice = 51:100)
+```
+
+### Description Table
+```{r shap_FeatureDesc_AllLYNF, eval=TRUE, echo=FALSE}
+AllshapFeatureDescTable(.obj = AllLYNF.shap)
+```
+
+### No fungicide: phi vs yield difference
+```{r shap_phiyld_AllLYNF, eval=TRUE, echo=FALSE}
+Allphi.yld(.obj = AllLYNF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+## A focus on the highest-yield fields {.tabset .tabset-fade .tabset-pills}
+### The field locations
+```{r shap_HQ_Locations, eval=TRUE, echo=FALSE}
+# Map the field locations of this subset of fields
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dat %>% dplyr::filter(yield > quantile(yield, 0.90)), 
+             aes(x = longitude, y = latitude, colour = foliar.fungicide), size = 1.1, alpha = 0.5) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Foliar fungicide", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("Fields in the top 10th quantile for yield") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+### Summaries {.tabset .tabset-fade .tabset-pills}
+#### Latitude
+```{r shap_HQ_Latitude, eval=TRUE, echo=FALSE}
+dat %>% 
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  select(foliar.fungicide, latitude) %>%
+  ggplot(aes(x = foliar.fungicide, y = latitude)) +
+  geom_boxplot(fill = "skyblue") +
+  theme_bw() +
+  xlab("Foliar fungicide") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+```
+
+#### GDD
+```{r shap_HQ_GDD, eval=TRUE, echo=FALSE}
+dat %>% 
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  select(foliar.fungicide, GDD) %>%
+  group_by(GDD) %>%
+  count(foliar.fungicide) %>%
+  knitr::kable(., row.names = FALSE, align = "lcc", col.names = c("GDD", "Fungicide use", "No. of fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+#### doy
+```{r shap_HQ_doy, eval=TRUE, echo=FALSE}
+dat %>% 
+  dplyr::filter(yield > quantile(yield, 0.90)) %>%
+  select(foliar.fungicide, doy) %>%
+  ggplot(aes(x = foliar.fungicide, y = doy)) +
+  geom_boxplot(fill = "skyblue") +
+  theme_bw() +
+  xlab("Foliar fungicide") +
+  ylab("Planting (doy)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+```
+
+
+### Predicted yield summary
+```{r shap_TableAllHQ, eval=TRUE, echo=FALSE}
+dplyr::bind_rows(
+HQNF.shap %>%  
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::summarise(n = n(), mnyld = mean(actual), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(mnyld = sprintf("%.1f", mnyld),
+                minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  dplyr::mutate(fungicide = "No") %>%
+  dplyr::select(fungicide, everything()),
+
+HQF.shap %>%  
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::summarise(n = n(), mnyld = mean(actual), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(mnyld = sprintf("%.1f", mnyld),
+                minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  dplyr::mutate(fungicide = "Yes") %>%
+  dplyr::select(fungicide, everything())
+) %>% 
+  knitr::kable(., row.names = FALSE, align = "lcccc", col.names = c("Fungicide use", "No. of fields", "Mean Yield", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+### Fungicides applied {.tabset .tabset-fade .tabset-pills}
+```{r shap_HQF_yldphi_range, eval=FALSE, echo=FALSE}
+Allrngf(.obj = HQF.shap) 
+```
+
+#### Feature values {.tabset .tabset-fade .tabset-pills}
+##### Fields 1:12
+```{r shap_plotHQF_1_to_12, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 1:12)
+```
+
+##### Fields 13:24
+```{r shap_plotHQF_13_to_24, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 13:24)
+```
+
+##### Fields 25:36
+```{r shap_plotHQF_25_to_36, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 25:36)
+```
+
+##### Fields 37:48
+```{r shap_plotHQF_37_to_48, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 37:48)
+```
+
+##### Fields 49:60
+```{r shap_plotHQF_49_to_60, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 49:60)
+```
+
+##### Fields 61:72
+```{r shap_plotHQF_61_to_72, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 61:72)
+```
+
+##### Fields 73:84
+```{r shap_plotHQF_73_to_84, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 73:84)
+```
+
+##### Fields 85:96
+```{r shap_plotHQF_85_to_96, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 85:96)
+```
+
+##### Fields 97:108
+```{r shap_plotHQF_97_to_108, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 97:108)
+```
+
+##### Fields 109:120
+```{r shap_plotHQF_109_to_120, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 109:120)
+```
+
+##### Fields 121:132
+```{r shap_plotHQF_121_to_132, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 121:132)
+```
+
+##### Fields 133:144
+```{r shap_plotHQF_133_to_144, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 133:144)
+```
+
+##### Fields 145:152
+```{r shap_plotHQF_145_to_152, eval=TRUE, echo=FALSE, fig.height=8.5, fig.width=10.0}
+AllplotFeatureVals(x = HQF.shap, .slice = 145:152)
+```
+
+#### Heatmap {.tabset .tabset-fade .tabset-pills}
+##### Fields 1 to 50
+```{r shap_HM_HQF_1_to_50, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = HQF.shap, .slice = 1:50)
+```
+
+##### Fields 51 to 100
+```{r shap_HM_HQF_51_to_100, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = HQF.shap, .slice = 51:100)
+```
+
+##### Fields 101 to 152
+```{r shap_HM_HQF_101_to_152, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = HQF.shap, .slice = 101:152)
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HQF, eval=TRUE, echo=FALSE}
+AllshapFeatureDescTable(.obj = HQF.shap)
+```
+
+#### Fungicide: phi vs yield difference
+```{r shap_phiyld_HQF, eval=TRUE, echo=FALSE}
+Allphi.yld(.obj = HQF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+### No fungicides used {.tabset .tabset-fade .tabset-pills}
+```{r shap_HQNF_yldphi_range, eval=FALSE, echo=FALSE}
+Allrngf(.obj = HQNF.shap) 
+```
+
+#### Feature values {.tabset .tabset-fade .tabset-pills}
+##### Fields 1:12
+```{r shap_plotHQNF_1_to_12, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 1:12)
+```
+
+##### Fields 13:24
+```{r shap_plotHQNF_13_to_24, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 13:24)
+```
+
+##### Fields 25:36
+```{r shap_plotHQNF_25_to_36, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 25:36)
+```
+
+##### Fields 37:48
+```{r shap_plotHQNF_37_to_48, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 37:48)
+```
+
+##### Fields 49:60
+```{r shap_plotHQNF_49_to_60, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 49:60)
+```
+
+##### Fields 61:72
+```{r shap_plotHQNF_61_to_72, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 61:72)
+```
+
+##### Fields 73:84
+```{r shap_plotHQNF_73_to_84, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 73:84)
+```
+
+##### Fields 85:96
+```{r shap_plotHQNF_85_to_96, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 85:96)
+```
+
+##### Fields 97:108
+```{r shap_plotHQNF_97_to_108, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 97:108)
+```
+
+##### Fields 109:120
+```{r shap_plotHQNF_109_to_120, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+AllplotFeatureVals(x = HQNF.shap, .slice = 109:120)
+```
+
+
+#### Heatmap {.tabset .tabset-fade .tabset-pills}
+##### Fields 1 to 40
+```{r shap_HM_HQNF_1_to_40, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = HQNF.shap, .slice = 1:40)
+```
+
+##### Fields 41 to 80
+```{r shap_HM_HQNF_41_to_80, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = HQNF.shap, .slice = 41:80)
+```
+
+##### Fields 81 to 120
+```{r shap_HM_HQNF_81_to_120, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+Allshap.heat(.obj = HQNF.shap, .slice = 81:120)
+```
+
+#### Description Table
+```{r shap_FeatureDesc_HQNF, eval=TRUE, echo=FALSE}
+AllshapFeatureDescTable(.obj = HQNF.shap)
+```
+
+#### No fungicide: phi vs yield difference
+```{r shap_phiyld_HQNF, eval=TRUE, echo=FALSE}
+Allphi.yld(.obj = HQNF.shap, ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+### All fields {.tabset .tabset-fade .tabset-pills}
+#### By MG
+```{r shap_phiyld_HQ_MG, eval=TRUE, echo=FALSE}
+## All HQ fields, plot points by MG and fungicide
+dplyr::bind_rows(
+HQF.shap %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+    dplyr::filter(feature == "foliar.fungicide") %>%
+    dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, ylddiff:MG)
+,
+HQNF.shap %>% 
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>% 
+  dplyr::mutate(MG = purrr::map_chr(shap, function(.shap) {
+    purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "MG.f") %>%
+      dplyr::select(feature.value) %>%
+      stringr::str_remove("MG.f=")})) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, ylddiff:MG)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG, shape = fung)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "MG", shape = "Fungicide")
+```
+
+#### By GDD
+```{r shap_phiyld_HQ_GDD, eval=TRUE, echo=FALSE}
+dplyr::bind_rows(
+  HQF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(fung = "Y") %>%
+    dplyr::select(fung, ylddiff:GDD)
+  ,
+  HQNF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(fung = "N") %>%
+    dplyr::select(fung, ylddiff:GDD)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD, shape = fung)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "GDD", shape = "Fungicide")
+```
+
+#### By doy
+```{r shap_phiyld_HQ_doy, eval=TRUE, echo=FALSE}
+dplyr::bind_rows(
+  HQF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(fung = "Y") %>%
+    dplyr::select(fung, ylddiff:doy)
+  ,
+  HQNF.shap %>% 
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>% 
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(fung = "N") %>%
+    dplyr::select(fung, ylddiff:doy)
+) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy, shape = fung)) +
+  geom_point() +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(0, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Planting doy", shape = "Fungicide")
+```
+
+
+
+## By Maturity group {.tabset .tabset-fade .tabset-pills}
+***
+
+Look at the top 50 highest-yielding fungicide-treated fields and non-treated fields in each maturity group.
+
+```{r Shapley_MG_functions, eval=TRUE, echo=FALSE}
+## Additional functions pertaining to the MG set of shap objects.
+
+MGplotFeatureVals <- function(x, .MG, .slice) {
+  # Plot a grid of the feature values vs the Shapley phi for a specified set of fields in a MG
+  # Modeled after the lime plot_features output
+  # Args:
+  #  x = a list by MG of fitted Shapley values
+  #  .MG = character string for the TED of interest
+  #  .slice = 1:10 or 11:20 for the fields sampled in the MG
+  # Returns:
+  #  a grid of plots of the Shapley values for the sampled fields
+  #
+  z <- 
+    purrr::pluck(x, .MG) %>% 
+    dplyr::slice(.slice) %>%
+  # Add on the shapley plots:
+  dplyr::mutate(plt = purrr::map2(sample_id, shap, shap.plot))
+  
+  # And plot in a grid:
+  gridExtra::grid.arrange(grobs = z %>% purrr::pluck(., "plt"), ncol = 3,
+                          bottom = grid::textGrob("phi", gp = grid::gpar(fontsize = 12, fontface = "bold")),
+                          left = grid::textGrob("Feature value", rot = 90, gp = grid::gpar(fontsize = 12, 
+                                                                                           fontface = "bold")))
+}  # end function MGplotFeatureVals
+
+
+MGshap.heat <- function(.obj, .MG) {
+  # Plots a heatmap of the Shapley phi values
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for the sampled fields in a MG 
+  #  .MG = character string for the MG
+  # Returns:
+  #  a heatmap plot of the Shapley phi values
+  #
+  # Extract the Shapley values for fields in the selected MG
+  z <- 
+  .obj %>%
+  purrr::pluck(., .MG) %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, everything())})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  purrr::map_dfr(., bind_rows)
+  
+  num_cases <- unique(as.numeric(z$id))
+  z$id <- factor(z$id, levels = as.character(sort(num_cases)))
+  
+  z$feature.value <- factor(
+    z$feature.value,
+    levels = rev(unique(z$feature.value[order(z$feature, z$phi)]))
+  )
+  
+  # plot the heatmap:
+  ggplot(z, aes(id, feature.value)) +
+    geom_tile(aes(fill = phi)) +
+    scale_x_discrete('Case', expand = c(0, 0)) +
+    scale_y_discrete('Feature', expand = c(0, 0)) +
+    # The next line is the color scheme that appeared in the GitHub code:
+    # scale_fill_gradient2('Feature\nweight', low = 'firebrick', mid = '#f7f7f7', high = 'steelblue') +
+    scale_fill_gradient2('Shapley\nphi', low = "#8e0152", mid = "#f7f7f7", high = "#276419") +
+    theme_shap() +
+    theme(panel.border = element_rect(fill = NA, colour = 'grey60', size = 1),
+          panel.grid = element_blank(),
+          legend.position = 'right',
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          axis.text.y = element_text(size = 5))
+}  # end function MGshap.heat
+
+
+MGshapFeatureDescTable <- function(.obj, .MG) {
+  # Table the number of times a feature description appeared in an explanation over the number of fields 
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each MG
+  #  .MG = character string for the MG
+  #
+  # Returns:
+  # a kable-styled table of the feature, feature description, the number of times the description appeared and the total number of fields in the local observation set
+  #
+  #
+  # No. of cases (fields) sampled from the MG:
+  no.cases <- .obj %>% purrr::pluck(., .MG, "sample_id") %>% unique(.) %>% length(.)
+  
+  # Get the feature.value and no. times it appeared among the sampled fields
+  .obj %>%
+  purrr::pluck(., .MG) %>%
+  dplyr::mutate(hm = purrr::map2(sample_id, shap, ~{purrr::pluck(.y, "res") %>% 
+      dplyr::mutate(id = .x) %>% 
+      dplyr::select(id, feature, feature.value)})) %>%
+  # Now extract the hm data frames into one data frame:
+  dplyr::select(hm) %>%
+  purrr::map_dfr(., bind_rows) %>%
+  dplyr::group_by(feature) %>%  
+  dplyr::count(feature.value) %>%
+  dplyr::mutate(no.cases = no.cases) %>%
+  knitr::kable(., row.names = TRUE, align = "lccc", col.names = c("Feature", "Feature description", "No. appearances", "No. fields")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive")) %>%
+    scroll_box(width = "500px", height = "400px")
+  }  # end function MGshapFeatureDescTable
+
+
+MGphi.yld <- function(.obj, .MG, ly, uy, lx, ux) {
+  # Plots the Shapley phi values vs the yield difference for the fungicides feature
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each MG
+  #  .MG = character string for the MG
+  #
+  # Returns:
+  # a ggplot of the data
+  #
+  .obj %>% 
+  purrr::pluck(., .MG) %>%
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>%
+  dplyr::mutate(phi.c = ifelse(phi > 0, "H", "L")) %>%
+  dplyr::mutate(phi.c = factor(phi.c, levels = c("H", "L"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = phi.c)) +
+  geom_point(show.legend = FALSE) +
+  scale_colour_manual(values = mypalette, drop = FALSE) +
+  theme_bw() +
+  ylim(ly, uy) +
+  xlim(lx, ux) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8))
+}  # end function MGphi.yld
+
+
+MGphiyldData <- function(.obj, .MG) {
+  # Extract the yield difference and phi data for the fields in a given maturity group
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each MG
+  #  .MG = character string for the MG
+  #
+  # Returns
+  #  a data frame/tibble with the data values
+  #
+  .obj %>% 
+  purrr::pluck(., .MG) %>%
+  dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+  dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+  dplyr::mutate(ylddiff = actual - mn) %>%
+  dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+      dplyr::filter(feature == "foliar.fungicide") %>%
+      dplyr::pull(phi)})) %>%
+  dplyr::mutate(MG = .MG) %>%
+  dplyr::select(MG, actual, mn, ylddiff, phi)
+}  # end function MGphiyldData
+```
+
+### Locations
+A map of the fields, points colored by fungicide status, panelled by MG.
+```{r shap_HY_MG_Locations, eval=TRUE, echo=FALSE}
+ggplot() +
+  geom_sf(data = soy2) +
+  theme_bw() +
+  geom_point(data = dplyr::bind_rows(
+purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "no") %>% dplyr::mutate(fung = "No"),
+purrr::map_dfr(c("0", "I", "II", "III", "IV"), MGHY, x = 50, fung = "yes") %>% dplyr::mutate(fung = "Yes")),
+aes(x = longitude, y = latitude, colour = factor(fung)), size = 1.3, alpha = 0.5) +
+scale_color_brewer(type = "qual", palette = "Set2", direction = 1) +
+  facet_wrap(~ MG.f) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 6, angle = 90),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 6)) +
+  guides(colour = guide_legend(nrow = 1, title = "Fungicide use", override.aes = list(alpha = 1))) +
+  theme(legend.position = "bottom", legend.background = element_rect(fill = NULL, colour = "black")) +
+  ggtitle("50 highest-yielding fungicide-treated and untreated fields per MG") +
+  theme(plot.title = element_text(color = "darkgreen", size = 12, hjust = 0.5))
+```
+
+### Fungicides not applied {.tabset .tabset-fade .tabset-pills}
+```{r shap_MGHYNF_yldphi_range, eval=FALSE, echo=FALSE}
+rngf(z = 1:5, obj = MGHYNF.shap) 
+```
+
+#### Predicted yield summary
+```{r shap_TableMGHYNF, eval=TRUE, echo=FALSE}
+purrr::map_df(c("0", "I", "II", "III", "IV"), function(.MG) {MGHYNF.shap %>%  
+  purrr::pluck(., .MG) %>%
+  dplyr::mutate(actual = map_dbl(shap, pluck, "actual")) %>%
+  dplyr::summarise(n = n(), mnyld = mean(actual), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(mnyld = sprintf("%.1f", mnyld),
+                minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  dplyr::mutate(MG = .MG, fungicide = "No") %>%
+  dplyr::select(MG, fungicide, everything())}) %>% 
+  knitr::kable(., row.names = FALSE, align = "lccccc", col.names = c("Maturity group", "Fungicide use", "No. of fields", "Mean Yield", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+#### MG 0 {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYNF_0_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "0", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYNF_0_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "0", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYNF_0_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "0", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYNF_0_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "0", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYNF_0_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "0", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYNF_0, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYNF.shap, .MG = "0")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYNF_0, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYNF.shap, .MG = "0")
+```
+
+##### No fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYNF_0, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYNF.shap, .MG = "0", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+#### MG I {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYNF_I_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "I", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYNF_I_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "I", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYNF_I_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "I", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYNF_I_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "I", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYNF_I_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "I", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYNF_I, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYNF.shap, .MG = "I")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYNF_I, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYNF.shap, .MG = "I")
+```
+
+##### No fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYNF_I, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYNF.shap, .MG = "I", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+#### MG II {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYNF_II_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "II", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYNF_II_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "II", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYNF_II_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "II", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYNF_II_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "II", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYNF_II_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "II", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYNF_II, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYNF.shap, .MG = "II")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYNF_II, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYNF.shap, .MG = "II")
+```
+
+##### No fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYNF_II, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYNF.shap, .MG = "II", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+#### MG III {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYNF_III_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "III", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYNF_III_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "III", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYNF_III_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "III", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYNF_III_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "III", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYNF_III_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "III", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYNF_III, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYNF.shap, .MG = "III")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYNF_III, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYNF.shap, .MG = "III")
+```
+
+##### No fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYNF_III, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYNF.shap, .MG = "III", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+#### MG IV {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYNF_IV_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "IV", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYNF_IV_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "IV", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYNF_IV_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "IV", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYNF_IV_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "IV", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYNF_IV_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYNF.shap, .MG = "IV", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYNF_IV, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYNF.shap, .MG = "IV")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYNF_IV, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYNF.shap, .MG = "IV")
+```
+
+##### No fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYNF_IV, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYNF.shap, .MG = "IV", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+#### phi vs yield difference: All MG
+```{r shap_phiyld_MGHYNF_AllMG, eval=TRUE, echo=FALSE}
+d <- 
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldData, .obj = MGHYNF.shap) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"), labels = c("0", "I", "II", "III", "IV"))) %>%
+  dplyr::group_by(MG) %>%
+  # Using descriptive names, so hence the quotes:
+  dplyr::summarise(`Min Yld` = min(actual), `Max Yld` = max(actual), `Mean Yld` = mean(actual)) %>%
+  dplyr::ungroup() %>%
+  # Restrict display to 1 decimal place:
+  dplyr::mutate(`Min Yld` = sprintf("%.1f", `Min Yld`),
+                `Max Yld` = sprintf("%.1f", `Max Yld`),
+                `Mean Yld` = sprintf("%.1f", `Mean Yld`)) %>%
+  # I want the rows labelled by MG:
+  tibble::column_to_rownames(var = "MG")
+
+# Now you can plot the table as an insert, using gridExtra grobs:
+purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldData, .obj = MGHYNF.shap) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  theme_bw() +
+  ylim(-3.0, 7.0) +
+  xlim(-40, 35) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.background = element_rect(fill = NULL, colour = "black")) +
+  # Use the rowhead argument to set the labels to non-italic bold:
+  annotation_custom(gridExtra::tableGrob(d, 
+                              theme = ttheme_default(base_size = 7,
+                                                     rowhead = list(fg_params = list(col = "black", fontface = 2L)))), 
+                    xmin = -40, xmax = -20, ymin = 4.0, ymax = 7.4)
+```
+
+
+
+### Fungicides applied {.tabset .tabset-fade .tabset-pills}
+```{r shap_MGHYF_yldphi_range, eval=FALSE, echo=FALSE}
+rngf(z = 1:5, obj = MGHYF.shap) 
+```
+
+#### Predicted yield summary
+```{r shap_TableMGHYF, eval=TRUE, echo=FALSE}
+purrr::map_df(c("0", "I", "II", "III", "IV"), function(.MG) {MGHYF.shap %>%  
+  purrr::pluck(., .MG) %>%
+  dplyr::mutate(actual = map_dbl(shap, pluck, "actual")) %>%
+  dplyr::summarise(n = n(), mnyld = mean(actual), minyld = min(actual), maxyld = max(actual)) %>%
+  dplyr::mutate(mnyld = sprintf("%.1f", mnyld),
+                minyld = sprintf("%.1f", minyld),
+                maxyld = sprintf("%.1f", maxyld)) %>%
+  dplyr::mutate(MG = .MG, fungicide = "Yes") %>%
+  dplyr::select(MG, fungicide, everything())}) %>% 
+  knitr::kable(., row.names = FALSE, align = "lccccc", col.names = c("Maturity group", "Fungicide use", "No. of fields", "Mean Yield", "Min Yield", "Max Yield")) %>%  
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+
+#### MG 0 {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYF_0_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "0", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYF_0_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "0", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYF_0_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "0", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYF_0_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "0", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYF_0_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "0", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYF_0, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYF.shap, .MG = "0")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYF_0, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYF.shap, .MG = "0")
+```
+
+##### Fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYF_0, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYF.shap, .MG = "0", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+#### MG I {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYF_I_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "I", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYF_I_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "I", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYF_I_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "I", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYF_I_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "I", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYF_I_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "I", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYF_I, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYF.shap, .MG = "I")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYF_I, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYF.shap, .MG = "I")
+```
+
+##### Fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYF_I, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYF.shap, .MG = "I", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+#### MG II {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYF_II_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "II", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYF_II_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "II", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYF_II_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "II", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYF_II_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "II", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYF_II_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "II", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYF_II, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYF.shap, .MG = "II")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYF_II, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYF.shap, .MG = "II")
+```
+
+##### Fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYF_II, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYF.shap, .MG = "II", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+#### MG III {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYF_III_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "III", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYF_III_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "III", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYF_III_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "III", .slice = 21:30)
+```
+
+###### Fields 31:40
+```{r shap_plotMGHYF_III_31_to_40, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "III", .slice = 31:40)
+```
+
+###### Fields 41:50
+```{r shap_plotMGHYF_III_41_to_50, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "III", .slice = 41:50)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYF_III, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYF.shap, .MG = "III")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYF_III, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYF.shap, .MG = "III")
+```
+
+##### Fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYF_III, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYF.shap, .MG = "III", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+#### MG IV {.tabset .tabset-fade .tabset-pills}
+##### Feature values {.tabset .tabset-fade .tabset-pills}
+###### Fields 1:10
+```{r shap_plotMGHYF_IV_1_to_10, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "IV", .slice = 1:10)
+```
+
+###### Fields 11:20
+```{r shap_plotMGHYF_IV_11_to_20, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "IV", .slice = 11:20)
+```
+
+###### Fields 21:30
+```{r shap_plotMGHYF_IV_21_to_30, eval=TRUE, echo=FALSE, fig.height=10.5, fig.width=10.0}
+MGplotFeatureVals(x = MGHYF.shap, .MG = "IV", .slice = 21:30)
+```
+
+##### Heatmap
+```{r shap_HM_MGHYF_IV, eval=TRUE, echo=FALSE, fig.height=19.0, fig.width=10.0}
+MGshap.heat(.obj = MGHYF.shap, .MG = "IV")
+```
+
+##### Description Table
+```{r shap_FeatureDesc_MGHYF_IV, eval=TRUE, echo=FALSE}
+MGshapFeatureDescTable(.obj = MGHYF.shap, .MG = "IV")
+```
+
+##### Fungicide: phi vs yield difference
+```{r shap_phiyld_MGHYF_IV, eval=TRUE, echo=FALSE}
+MGphi.yld(.obj = MGHYF.shap, .MG = "IV", ly = -3.0, uy = 7.0, lx = -40, ux = 35)
+```
+
+
+#### phi vs yield difference: All MG
+```{r shap_phiyld_MGHYF_AllMG, eval=TRUE, echo=FALSE}
+d <- 
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldData, .obj = MGHYF.shap) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"), labels = c("0", "I", "II", "III", "IV"))) %>%
+  dplyr::group_by(MG) %>%
+  # Using descriptive names, so hence the quotes:
+  dplyr::summarise(`Min Yld` = min(actual), `Max Yld` = max(actual), `Mean Yld` = mean(actual)) %>%
+  dplyr::ungroup() %>%
+  # Restrict display to 1 decimal place:
+  dplyr::mutate(`Min Yld` = sprintf("%.1f", `Min Yld`),
+                `Max Yld` = sprintf("%.1f", `Max Yld`),
+                `Mean Yld` = sprintf("%.1f", `Mean Yld`)) %>%
+  # I want the rows labelled by MG:
+  tibble::column_to_rownames(var = "MG")
+
+# Now you can plot the table as an insert, using gridExtra grobs:
+purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldData, .obj = MGHYF.shap) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1) +
+  theme_bw() +
+  ylim(-3.0, 7.0) +
+  xlim(-40, 35) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.background = element_rect(fill = NULL, colour = "black")) +
+  # Use the rowhead argument to set the labels to non-italic bold:
+  annotation_custom(gridExtra::tableGrob(d, 
+                              theme = ttheme_default(base_size = 7,
+                                                     rowhead = list(fg_params = list(col = "black", fontface = 2L)))), 
+                    xmin = -40, xmax = -20, ymin = 4.0, ymax = 7.4)
+```
+
+
+### All Fields {.tabset .tabset-fade .tabset-pills}
+#### By MG
+```{r shap_phiyld_ALLMGHY_ByMG, eval=TRUE, echo=FALSE}
+dplyr::bind_rows(
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldData, .obj = MGHYNF.shap) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, MG, ylddiff, phi)
+  ,
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldData, .obj = MGHYF.shap) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, MG, ylddiff, phi)
+  ) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  dplyr::mutate(MG = factor(MG, levels = c("0", "I", "II", "III", "IV"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = MG, shape = fung)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(-40, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "MG", shape = "Fungicide")
+```
+
+#### By GDD
+```{r shap_phiyld_ALLMGHY_ByGDD, eval=TRUE, echo=FALSE}
+MGphiyldDataGDD <- function(.obj, .MG) {
+  # Extract the yield difference and phi data for the fields in a given maturity group
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each MG
+  #  .MG = character string for the MG
+  #
+  # Returns
+  #  a data frame/tibble with the data values, including the GDD feature value
+  #
+  .obj %>% 
+    purrr::pluck(., .MG) %>%
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>%
+    dplyr::mutate(GDD = purrr::map_chr(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "GDD") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=")})) %>%
+    dplyr::mutate(MG = .MG) %>%
+    dplyr::select(MG, actual, mn, ylddiff, phi, GDD)
+}  # end function MGphiyldDataGDD
+
+
+
+
+dplyr::bind_rows(
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldDataGDD, .obj = MGHYNF.shap) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, MG, GDD, ylddiff, phi)
+  ,
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldDataGDD, .obj = MGHYF.shap) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, MG, GDD, ylddiff, phi)
+  ) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  dplyr::mutate(GDD = factor(GDD, levels = c("01", "02", "03", "04", "05"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = GDD, shape = fung)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(-40, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "GDD", shape = "Fungicide")
+```
+
+#### By doy
+```{r shap_phiyld_ALLMGHY_Bydoy, eval=TRUE, echo=FALSE}
+MGphiyldDatadoy <- function(.obj, .MG) {
+  # Extract the yield difference and phi data for the fields in a given maturity group
+  # Args:
+  #  .obj = a nested tibble with the Shapley values for each MG
+  #  .MG = character string for the MG
+  #
+  # Returns
+  #  a data frame/tibble with the data values, including the doy feature value
+  #
+  .obj %>% 
+    purrr::pluck(., .MG) %>%
+    dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+    dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+    dplyr::mutate(ylddiff = actual - mn) %>%
+    dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "foliar.fungicide") %>%
+        dplyr::pull(phi)})) %>%
+    dplyr::mutate(doy = purrr::map_dbl(shap, function(.shap) {
+      purrr::pluck(.shap, "res") %>% 
+        dplyr::filter(feature == "doy") %>%
+        dplyr::select(feature.value) %>%
+        stringr::str_remove(".*=") %>%
+        as.numeric()})) %>%
+    dplyr::mutate(MG = .MG) %>%
+    dplyr::select(MG, actual, mn, ylddiff, phi, doy)
+}  # end function MGphiyldDatadoy
+
+
+
+
+dplyr::bind_rows(
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldDatadoy, .obj = MGHYNF.shap) %>%
+  dplyr::mutate(fung = "N") %>%
+  dplyr::select(fung, MG, doy, ylddiff, phi)
+  ,
+  purrr::map_df(c("0", "I", "II", "III", "IV"), MGphiyldDatadoy, .obj = MGHYF.shap) %>%
+  dplyr::mutate(fung = "Y") %>%
+  dplyr::select(fung, MG, doy, ylddiff, phi)
+  ) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("N", "Y"))) %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = doy, shape = fung)) +
+  geom_point() +
+  scale_colour_distiller(palette = "Spectral") +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  xlim(-40, 35) +
+  ylim(-3.0, 7.0) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "right", legend.direction = "vertical", legend.box = "vertical") +
+  labs(colour = "Planting doy", shape = "Fungicide")
+```
+
+
+## Comparisons {.tabset .tabset-fade .tabset-pills}
+### Top 12 TEDs, best-yielding fields
+For each of the 12 TEDs, we have two groups:
+
+* the 20 best-yielding fields, foliar fungicides applied
+* the 20 best-yielding fields, foliar fungicides **not** applied
+
+```{r shap_Comparisons_Top12_HYF_HYNF, eval=TRUE, echo=FALSE}
+# Now you want to generalize for any TED, iterating over the sample_id in the TED, for any one of HYF, HYNF, LYF, LYNF:
+fx <- function(.dat, .TED) {
+  # for any one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap, iterate over sample_id in a TED and get the yield differencee and phi values along with other information for plotting
+  # Args:
+  #  .dat = one of HYF.shap, HYNF.shap, LYF.shap, LYNF.shap
+  #  .TED = a TED in one of the .shap files
+  # Returns:
+  #  a data frame of extracted phi and other components for each field
+  #
+  # Number of sample_id (fields) in a given TED:
+  sl <- purrr::pluck(.dat, .TED, "sample_id") %>% length()
+  
+  # Iterate over all the sample_id in the TED:
+  purrr::map_df(1:sl, function(.i) {
+    purrr::pluck(.dat, .TED) %>% 
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(TED = .TED) %>%
+      dplyr::select(sample_id, TED, ylddiff, phi, fung)
+  }
+  )
+}  # end fx
+
+
+# Example of use:
+# fx(.dat = HYNF.shap, .TED = "303603")
+
+# Now apply fx over all the TEDs, for HYF and HYNF and bind into a data.frame:
+HY <-
+  dplyr::bind_rows(
+  purrr::map_df(HYF.shap %>% names(), fx, .dat = HYF.shap),
+  purrr::map_df(HYNF.shap %>% names(), fx, .dat = HYNF.shap)) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("303603", "303703", "403603", "403703", "504803", "602303", "603503", "603603", "603703", "604503", "604603", "604803"))) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("no", "yes"), labels = c("No", "Yes")))
+
+# and now plot...
+HY %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = fung)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ TED) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "Foliar fungicide")
+```
+
+
+### Fungicide-sprayed fields, the highest and lowest yielding fields top TEDs
+Within each TED:
+
+* consider the subset of fields that were sprayed.
+* divide into highest- and lowest-yielding fields (aim for 20 per group)
+* there were enough fields in only 6 TEDs: "504803", "603503", "603603", "603703", "604603", "604803"
+
+```{r shap_Comparisons_Top12_HYF_LYF, eval=TRUE, echo=FALSE}
+# HYF.shap %>% names()
+# LYF.shap %>% names()  # only 6 TEDs: "504803", "603503", "603603", "603703", "604603", "604803"
+
+# Therefore we need the corresponding TEDs in HYF:
+HYFsub.shap <- HYF.shap[c("504803", "603503", "603603", "603703", "604603", "604803")]
+
+# Prepare the data:
+HYLY <-
+  dplyr::bind_rows(
+    purrr::map_df(HYFsub.shap %>% names(), fx, .dat = HYFsub.shap) %>% dplyr::mutate(yldenv = "High"),
+    purrr::map_df(LYF.shap %>% names(), fx, .dat = HYNF.shap) %>% dplyr::mutate(yldenv = "Low")
+  ) %>%
+  dplyr::mutate(TED = factor(TED, levels = c("504803", "603503", "603603", "603703", "604603", "604803"))) %>%
+  dplyr::mutate(yldenv = factor(yldenv, levels = c("Low", "High"))) %>%
+  dplyr::select(-fung)
+
+# Now plot...
+HYLY %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = yldenv)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_wrap(~ TED) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8),
+        plot.title = element_text(color = "darkgreen", size = 16, hjust = 0)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "Yield classification") +
+  ggtitle("Foliar fungicide applied")
+```
+
+
+### All TEDs
+Removing the TED restriction, the focus here is on 100 fields in each of the four groups:
+
+* Fungicides used, best-yielding fields
+* Fungicides **not** used, best-yielding fields
+* Fungicides used, worst-yielding fields
+* Fungicides **not** used, worst-yielding fields
+
+```{r shap_Comparisons_All, eval=TRUE, echo=FALSE}
+# Define a helper function:
+fxa <- function(.dat, .yldenv) {
+  # Extract the phi values from one of the Allxx.shap objects.
+  # Args:
+  #  .dat = one of AllHYF.shap, AllHYNF.shap, AllLYF.shap, AllLYNF.shap
+  #  .yldenv = character string for best- or worst-yielding fields ("Low", "High")
+  # Returns:
+  #  a data frame of the extracted values
+  #
+  # Iterate over all the sample_id (there are 100 fields in each of the `All` groups:
+  purrr::map_df(1:100, function(.i) {
+      .dat %>%
+      dplyr::slice(.i) %>% 
+      dplyr::mutate(actual = purrr::map_dbl(shap, purrr::pluck, "actual")) %>%
+      dplyr::mutate(mn = purrr::map_dbl(shap, purrr::pluck, "mean")) %>%
+      dplyr::mutate(ylddiff = actual - mn) %>%
+      dplyr::mutate(phi = purrr::map_dbl(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::pull(phi)})) %>%
+      dplyr::mutate(fung = purrr::map_chr(shap, function(.shap) {
+        purrr::pluck(.shap, "res") %>% 
+          dplyr::filter(feature == "foliar.fungicide") %>%
+          dplyr::select(feature.value) %>%
+          stringr::str_remove(".*=")})) %>%
+      dplyr::mutate(yldenv = .yldenv) %>%
+      dplyr::select(sample_id, ylddiff, phi, fung, yldenv)
+  }
+  )
+}  # end fxa
+
+# Prep the data:
+alldf <- 
+dplyr::bind_rows(fxa(.dat = AllHYF.shap, .yldenv = "High"),
+                 fxa(.dat = AllHYNF.shap, .yldenv = "High"),
+                 fxa(.dat = AllLYF.shap, .yldenv = "Low"),
+                 fxa(.dat = AllLYNF.shap, .yldenv = "Low")) %>%
+  dplyr::mutate(yldenv = factor(yldenv, levels = c("Low", "High"))) %>%
+  dplyr::mutate(fung = factor(fung, levels = c("no", "yes"), labels = c("No", "Yes")))
+
+# Now plot:
+alldf %>%
+  ggplot(., aes(x = ylddiff, y = phi, colour = fung, shape = yldenv)) +
+  geom_point() +
+  scale_color_brewer(type = "qual", palette = "Set1", direction = 1, drop = FALSE) +
+  theme_bw() +
+  geom_hline(yintercept = 0, linetype = 2) +
+  ylab("Shapley phi") +
+  xlab("Yield difference (actual - average)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 8, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 8)) +
+  theme(legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal") +
+  labs(colour = "Fungicide", shape = "Yield classification")
+```
+

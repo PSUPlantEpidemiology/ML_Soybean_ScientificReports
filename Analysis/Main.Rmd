@@ -1,0 +1,1036 @@
+---
+title: "Code for: A machine learning interpretation of the contribution of foliar fungicides to soybean yield in the north‐central United States"
+author: D.A. Shah, T.R. Butts, S. Mourtzinis, J.I. Rattalino Edreira, P. Grassini, S.P. Conley, P.D. Esker
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    fig_caption: yes
+    highlight: tango
+    number_sections: true
+    theme: cerulean
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+----------------------------------------------------------------------------------------------------
+
+
+```{r setup, include=FALSE, eval=TRUE}
+require(knitr)
+knitr::opts_chunk$set(cache=TRUE, fig.path = 'MainFigureI/')
+```
+
+
+<!--- Load libraries and process data for plotting -->
+```{r libraries, echo=FALSE, eval=TRUE, message=FALSE}
+library(tidyverse)
+# tidyverse_packages(include_self = FALSE)
+# Loads: dplyr forcats ggplot2 lubridate purrr tibble
+
+
+library(psych)
+library(caret)
+library(randomForest)
+library(ranger)
+
+library(parallel)
+library(doParallel)
+
+library(vip)
+library(pdp)
+
+library(lime)
+
+library(sf)
+# NOTE: sf requires maptools, rgeos to be loaded
+library(viridis)
+library(RColorBrewer)
+
+library(kableExtra)
+
+# For parallel processing of purrr map functions:
+# library(furrr)
+# library(future)
+# future::plan(multiprocess)
+
+library(iml)
+
+library(gridExtra)
+library(grid)
+```
+
+
+```{r Functions, eval=TRUE, echo=FALSE}
+PlotTestPreds <- function(x, my.title = NULL) {
+  # A function to calculate and plot RF predictions on the test data set
+  #
+  # Args:
+  #  x = a fitted caret RF model object
+  #
+  # Returns:
+  #  A plot of the actual and predicted yield on the test data
+  # 
+  predicted <- predict(x, newdata = testing)
+  residuals <- testing$yield - predicted
+  RMSE <- sqrt(mean(residuals^2))
+  cat('The root mean square error of the test data is ', round(RMSE, 3),'\n')
+  
+  y_test_mean <- mean(testing$yield)
+  # Calculate total sum of squares
+  tss <- sum((testing$yield - y_test_mean)^2)
+  # Calculate residual sum of squares
+  rss <- sum(residuals^2)
+  # Calculate R-squared
+  rsq <- 1 - (rss/tss)
+  cat('The R-square of the test data is ', round(rsq, 3), '\n')
+  
+  # Plotting actual vs predicted
+  # options(repr.plot.width = 8, repr.plot.height = 4)
+  my_data <- as.data.frame(cbind(predicted = predicted, observed = testing$yield))
+  
+  # Plot predictions vs test data
+  ggplot(my_data, aes(x = observed, y = predicted)) + 
+  geom_point(color = "darkred", alpha = 0.5) + 
+  coord_fixed(xlim =c(10, 90), ylim = c(10, 90)) + 
+  geom_smooth(method = lm) +
+  # geom_abline(intercept = 0, slope = 1, size = 1) +
+  geom_segment(aes(x = 12.5, xend = 87.5, y = 12.5, yend = 87.5), size = 1) +
+  ggtitle(my.title) +
+  ylab("Predicted Yield") + 
+  xlab("Observed Yield") + 
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, hjust = 0.5),
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14))
+}
+```
+
+
+<!--- Read in the management data -->
+```{r MgmtData, eval=TRUE, echo=FALSE}
+# Set the path to your particular environment:
+# load("~/EskerSoybean/ScientificReportsGitHub/Data/Mgmt.RData")
+# for knitr only:
+load("../Data/Mgmt.RData")
+```
+
+
+<!--- # Data prep and checks -->
+```{r TED_Deconstruction, eval=FALSE, echo=FALSE}
+# Deconstructing the TED variable:
+dat %>% 
+  dplyr::count(TED)
+# TED is a numeric:
+str(dat$TED)
+
+# The first digit of a TED is the coarse (7-category) root zone plant-available water holding capacity (RZPAWHC) taking on the values of: 100,000, 200,000, ..., 700,000
+dat %>% 
+  dplyr::mutate(RZPAWHC = stringr::str_sub(as.character(TED), 1, 1)) %>%
+  dplyr::count(RZPAWHC)
+
+# The GDD is a  10-category variable taking on the values of: 1,000, 2,000, ..., 10,000
+dat %>% 
+  dplyr::mutate(GDD = stringr::str_sub(as.character(TED), 2, 3)) %>%
+  dplyr::count(GDD)
+
+# The annual aridity index (AI) is a 10-category variable taking on the values of: 000, 100, 200, ..., 900
+dat %>% 
+  dplyr::mutate(AI = stringr::str_sub(as.character(TED), 4, 4)) %>%
+  dplyr::count(AI)
+
+# Temperature seasonality is a 3-category variable taking on the values 01, 02, 03
+# HOWEVER: all fields have the same value (03)
+dat %>% 
+  dplyr::mutate(TS = stringr::str_sub(as.character(TED), 5, 6)) %>%
+  dplyr::count(TS)
+```
+
+
+```{r RFDataPrep, eval=TRUE, echo=FALSE, results='hide'}
+# For modeling drop: order, state, year, TED, longitude
+datII <- dat %>% dplyr::select(-order, -state, -year, -TED, -longitude)
+
+# Set seed for reproducibility:
+set.seed(14092)
+
+# Create training & testing data sets
+inTraining <- caret::createDataPartition(datII$yield, p = 0.80, list = FALSE)
+training <- datII[inTraining, ]
+testing <- datII[-inTraining, ]
+
+# set up training run for x / y syntax because model format performs poorly
+x <- training %>% dplyr::select(-yield) %>% as.data.frame(.)
+y <- training %>% dplyr::pull(yield)
+```
+
+
+```{r DataChecks, eval=FALSE, echo=FALSE}
+# Yield check:
+datII %>%
+  dplyr::select(yield) %>%
+  ggplot(., aes(x = yield)) +
+  geom_histogram(binwidth = 2, fill = "grey90", colour = "black") +
+  theme_bw() +
+  xlab("Yield (bu/acre)") +
+  ylab("No. of fields") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+
+
+# Quantiles for yield:
+quantile(datII$yield)
+
+# Square root of the number of predictors: 4
+floor(sqrt(ncol(datII) - 1)) 
+```
+
+
+# Random forest modeling {.tabset .tabset-fade .tabset-pills}
+## Tuning
+Different tuning options are explored in the script `RFTest.Rmd`. On the training data, the best tuning options were returned by the `tuneRanger` package, which makes use of sequential model-based optimization. 
+
+The graph below shows the predictions on the test data for the RF model tuned on the training data. There is a tendency to underpredict high yields, and to overpredict the low yields.
+
+
+```{r RF_Tune_Training, eval=TRUE, echo=FALSE}
+# Use tuned parameters from tuneRanger, number of trees set to 1500.
+fit <- ranger::ranger(yield ~ ., data = training, 
+                      num.trees = 1500, 
+                      mtry = 5, 
+                      importance = "impurity", 
+                      min.node.size = 2, 
+                      replace = FALSE,
+                      sample.fraction =  0.88,
+                      respect.unordered.factors = 'order',
+                      seed = 14092)
+
+
+# The predicted values vs actual values on the test data:
+data.frame(actual = testing$yield, rngr = predict(fit, data = testing)$predictions) %>%
+  ggplot(., aes(x = actual, y = rngr)) + 
+  geom_point(color = "darkred", alpha = 0.5) + 
+  coord_fixed(xlim = c(10, 90), ylim = c(10, 90)) +
+  geom_smooth(method = lm) +
+  geom_segment(aes(x = 12.5, xend = 87.5, y = 12.5, yend = 87.5), size = 1) +
+  ggtitle("Predictions on the test data") +
+  ylab("Predicted yield") + 
+  xlab("Actual yield") + 
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, hjust = 0.5),
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14))
+```
+
+
+
+## Finalized model
+The finalized (tuned) random forest model is refit to the full data, using (i) the `ranger` package directly, (ii) using the `caret` matrix interface.
+
+We also use 3,000 trees for stability in the permutation-based variable importance measure (see Probst et al. WIRES article). Permutation-based variable importance is preferred over Gini variable importance measures because the latter is biased. 
+
+There are pros and cons to both. With directly fitting with `ranger`, can use the `vip` and `pdp` packages on the fitted object to get partial dependence plots, ICE curves. However, as `ranger` is not directly supported by `lime`, you'll have to build some functions to support the `ranger` package (it's fairly easy to do).
+
+There is direct support for `caret` in `lime`, but not in `vip` or `pdp`.
+
+We'll build the model both ways (directly with `ranger` and via the `caret` interface).
+
+```{r RF_ranger_fulldata, eval=TRUE, echo=FALSE}
+rm(list = ls()[!(ls() %in% c("dat", "datII"))]) 
+
+# Fit a random forest (fits in less than 1 sec)
+## impurity-based variable importance:
+rfo <- ranger::ranger(yield ~ ., data = datII, 
+                      num.trees = 3000, 
+                      mtry = 5, 
+                      importance = "impurity", 
+                      min.node.size = 2, 
+                      replace = FALSE,
+                      sample.fraction =  0.88,
+                      respect.unordered.factors = 'order',
+                      seed = 14092)
+
+## permutation-based variable importance:
+rfo.perm <- ranger::ranger(yield ~ ., data = datII, 
+                      num.trees = 3000, 
+                      mtry = 5, 
+                      importance = "permutation", 
+                      min.node.size = 2, 
+                      replace = FALSE,
+                      sample.fraction =  0.88,
+                      respect.unordered.factors = 'order',
+                      seed = 14092)
+```
+
+
+```{r RF_caret_fulldata, eval=TRUE, echo=FALSE}
+# set up training run for x / y syntax:
+x <- datII %>% dplyr::select(-yield) %>% as.data.frame(.)
+y <- datII %>% dplyr::pull(yield)
+
+# We are fitting a fixed model (no cross-validation): 
+fitControl <- trainControl(method = "none")
+
+# Fit with caret via x, y call:
+## impurity-based variable importance:
+caret_rf <- train(x, y, 
+                 method = "ranger", 
+                 trControl = fitControl, 
+                 verbose = FALSE, 
+                 ## Only a single model can be passed to the
+                 ## function when no resampling is used:
+                 tuneGrid = data.frame(.mtry = 5,
+                                       .splitrule = c("variance"),
+                                       .min.node.size = 2),
+                 num.trees = 3000,
+                 importance = "impurity",
+                 replace = FALSE,
+                 sample.fraction =  0.88,
+                 respect.unordered.factors = 'order',
+                 seed = 14092)
+
+## permutation-based variable importance:
+caret_rf.perm <- train(x, y, 
+                 method = "ranger", 
+                 trControl = fitControl, 
+                 verbose = FALSE, 
+                 ## Only a single model can be passed to the
+                 ## function when no resampling is used:
+                 tuneGrid = data.frame(.mtry = 5,
+                                       .splitrule = c("variance"),
+                                       .min.node.size = 2),
+                 num.trees = 3000,
+                 importance = "permutation",
+                 replace = FALSE,
+                 sample.fraction =  0.88,
+                 respect.unordered.factors = 'order',
+                 seed = 14092)
+
+rm(list = ls()[!(ls() %in% c("caret_rf", "caret_rf.perm", "dat", "datII", "rfo", "rfo.perm", "x", "y"))])
+```
+
+
+------------------------------------------------------------------------------------------------
+
+
+# Model interpretations {.tabset .tabset-fade .tabset-pills}
+## Residuals {.tabset .tabset-fade .tabset-pills}
+
+Residuals = actual - predicted yield  
+
+
+### Residuals vs predicted yield 
+The residuals plot shows that yields are being over-predicted (negative residuals) at low yields, and under-predicted (positive residuals) at high yields.
+
+```{r ResidualsvsPredicted, eval=TRUE, echo=FALSE}
+predicted <- predict(rfo, data = dat)$predictions
+residuals <- dat$yield - predicted
+  
+# Plotting...
+# options(repr.plot.width = 8, repr.plot.height = 4)
+my_data <- as.data.frame(cbind(predicted = predicted, residuals = residuals))
+  
+# Plot residuals vs predicted yield
+ggplot(my_data, aes(x = predicted, y = residuals)) + 
+  geom_point(color = "darkred", alpha = 0.5) + 
+  geom_smooth(method = lm) +
+  ggtitle("Residuals for yield") +
+  ylab("Residuals") + 
+  xlab("Predicted Yield") + 
+  theme(plot.title = element_text(color = "darkgreen", size = 16, hjust = 0.5),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12, hjust = 0.5),
+        axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14))
+```
+
+
+### Histogram
+```{r ResidualsHistogram, eval=TRUE, echo=FALSE}
+data.frame(predicted = predicted, residuals = residuals, MG = datII$MG.f) %>%
+  ggplot(., aes(x = residuals)) +
+  geom_histogram(binwidth = 0.1, fill = "grey90", colour = "black") +
+  theme_bw() +
+  xlab("Residual (bu/acre)") +
+  ylab("No. of fields") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+
+### Summary
+```{r ResidualsSummary, eval=TRUE, echo=FALSE}
+data.frame(residuals = residuals, MG = datII$MG.f) %>%
+  dplyr::group_by(MG) %>%
+  dplyr::summarise(min = min(residuals), max = max(residuals), mean = mean(residuals))
+```
+
+
+### Quantile-quantile plot
+```{r ResidualsQQPlot, eval=TRUE, echo=FALSE}
+data.frame(residuals = residuals, MG = datII$MG.f) %>%
+  ggplot(., aes(sample = residuals)) + 
+  stat_qq() +
+  stat_qq_line()
+```
+
+
+### Empirical cdf 
+99 percent of the residuals were <= |3.72 bu/acre|. 
+```{r ResidualsECDF, eval=TRUE, echo=FALSE}
+# From the tidyverse documentation (https://ggplot2.tidyverse.org/reference/stat_ecdf.html):
+# The empirical cumulative distribution function (ECDF) provides an alternative visualisation of distribution. Compared to other visualisations that rely on density (like geom_histogram()), the ECDF doesn't require any tuning parameters and handles both continuous and categorical variables. The downside is that it requires more training to accurately interpret, and the underlying visual tasks are somewhat more challenging.
+
+# Don't go to positive/negative infinity
+data.frame(residuals = residuals, MG = datII$MG.f) %>%
+  ggplot(., aes(residuals)) + stat_ecdf(geom = "step", pad = FALSE)
+
+# Proportion of residuals lying in |3.72|:
+data.frame(residuals = residuals, MG = datII$MG.f) %>%
+  dplyr::summarise(n = n(), y = sum(residuals <= abs(3.72)), prop = y/n)
+```
+
+
+--------------------------------------------------------------------------------------------------
+
+
+## Global interpretation of machine learning models {.tabset .tabset-fade .tabset-pills}
+Global interpretation is through: 
+
+* variable importance measures  
+* partial dependence plots 
+* ICE curves
+
+### Relative importance {.tabset .tabset-fade .tabset-pills}
+Relative importance is scaled relative to the variable with the largest importance (which is assigned an importance of 100%).
+
+#### Impurity-based
+Based on the impurity score.  
+```{r vip_Impurity, eval=TRUE, echo=FALSE}
+vip::vi(rfo) %>%
+  dplyr::mutate(Importance = 100*Importance/max(Importance)) %>%
+  # want higher relative importance to appear at the top of the plot:
+  dplyr::arrange(Importance) %>%
+  dplyr::mutate(Variable = factor(Variable, levels = .$Variable)) %>%
+  ggplot2::ggplot(., aes(x = Importance, y = Variable)) +
+  geom_point() +        
+  theme_bw() +
+  xlab("Relative importance (%)") +
+  theme(axis.title.x = element_text(face = "bold", size = 11)) + 
+  ylab("Variable") + 
+  theme(axis.title.y = element_text(face = "bold", size = 11))
+```
+
+
+#### Permutation-based
+```{r vip_Permutation, eval=TRUE, echo=FALSE}
+vip::vi(rfo.perm) %>%
+  dplyr::mutate(Importance = 100*Importance/max(Importance)) %>%
+  # want higher relative importance to appear at the top of the plot:
+  dplyr::arrange(Importance) %>%
+  mutate(Variable = factor(Variable, levels = .$Variable)) %>%
+  ggplot2::ggplot(., aes(x = Importance, y = Variable)) +
+  geom_point() +        
+  theme_bw() +
+  xlab("Relative importance (%)") +
+  theme(axis.title.x = element_text(face = "bold", size = 11)) + 
+  ylab("Variable") + 
+  theme(axis.title.y = element_text(face = "bold", size = 11))
+```
+
+
+#### PDP-based
+Based on partial dependence plots. The basic idea is that features that have larger marginal effects are of greater importance.
+
+This does take some time to fit.  Also, there is a warning: Setting `method = "pdp"` is experimental, use at your own risk!
+
+```{r vip_pdpBased, eval=TRUE, echo=FALSE, warning=FALSE}
+vip::vi(rfo, method = "pdp") %>%
+  dplyr::mutate(Importance = 100*Importance/max(Importance)) %>%
+  # want higher relative importance to appear at the top of the plot:
+  dplyr::arrange(Importance) %>%
+  mutate(Variable = factor(Variable, levels = .$Variable)) %>%
+  ggplot2::ggplot(., aes(x = Importance, y = Variable)) +
+  geom_point() +        
+  theme_bw() +
+  xlab("Relative importance (%)") +
+  theme(axis.title.x = element_text(face = "bold", size = 11)) + 
+  ylab("Variable") + 
+  theme(axis.title.y = element_text(face = "bold", size = 11))
+```
+
+
+
+#### Interpretation:  
+
+* you will not see the same ordering of variable importance estimated via the two options (page 218 in Boehmke and Greenwell). However, Probst et al. (WIRES) give reasons for preferring the permutation-based estimates.
+
+* perhaps the greatest difference between the two options is the importance of TWI.
+
+* variables associated with `location` (latitude, GDD) have the largest influences on yield.
+* doy (Day-of-Year; represents early vs late planting). But better to examine with pdp.
+* mid-pack we see other manipulable mgmt variables coming in: seeding rate (`seed.rate`) and maturity group (`Mg.f`).
+* chemicals (fungicide, herbicide, insecticide, seed treatment, starter fertilizer) perhaps not as influential as commonly perceived. Same could be said for row spacing.
+* building trust in the model: would have expected low influence of `manure` and `lime` (the latter being a local special situation decision), and we see just that in the relative importances.
+
+
+--------------------------------------------------------------------------------------------------
+
+
+### Partial dependence plots {.tabset .tabset-fade .tabset-pills}
+After the most globally relevant variables have been identified, the next step is to attempt to understand how the response variable changes based on these variables. For this we can use `partial dependence plots` (PDPs) and `individual conditional expectation (ICE) curves`. These techniques plot the change in the predicted value as specified feature(s) vary over their marginal distribution. Consequently, we can gain some local understanding how the response variable changes across the distribution of a particular variable but this still only provides a global understanding of this relationships across all observed data.
+
+
+```{r PDPlots_Exploration, eval=FALSE, echo=FALSE}
+# What is the range in actual and predicted yields?
+range(datII$yield)
+range(predict(rfo, data = datII)$predictions)
+
+
+## Get a vector of the categorical predictors (to pass onto pdp::partial)
+cat.vars <- c("MG.f", "foliar.fungicide", "foliar.insecticide", "herbicide", "iron.def", "lime", "manure", "PAWR", "row.space", "seed.trt1", "starter.fert", "texture.0.30", "GDD", "AI")
+
+
+# Default lattice-based PDP
+pdp::partial(rfo, train = datII, pred.var = "latitude", cats = cat.vars, type = "regression", plot = TRUE)
+
+# A more customizable plot using ggplot2
+pdp::partial(rfo, train = datII, pred.var = "latitude", cats = cat.vars) %>%
+  autoplot(smooth = TRUE, smooth.method = "loess", smooth.formula = y ~ x, smooth.span = 0.50, 
+           ylab = "yield") +
+  theme_light()
+
+# Check the pdp output for categorical predictors:
+pdp::partial(rfo, train = datII, pred.var = "MG.f", cats = cat.vars)
+pdp::partial(rfo, train = datII, pred.var = "foliar.fungicide", cats = cat.vars)
+
+### For categorical predictors, use geom_crossbar to display
+## Example: MG
+pdp::partial(rfo, train = datII, pred.var = "MG.f", cats = cat.vars) %>%
+  dplyr::mutate(MG.f = factor(MG.f, levels = c("0", "I", "II", "III", "IV"))) %>%
+  dplyr::mutate(lower = yhat + 0, upper = yhat + 0) %>%
+  ggplot(., aes(x = MG.f, y = yhat)) + 
+  geom_crossbar(aes(ymin = lower, ymax = upper), width = 0.3)
+```
+
+
+```{r PDP_Setup, eval=TRUE, echo=FALSE}
+## First, get a vector of the categorical predictors (to pass onto pdp::partial)
+cat.vars <- c("MG.f", "foliar.fungicide", "foliar.insecticide", "herbicide", "iron.def", "lime", "manure", "PAWR", "row.space", "seed.trt1", "starter.fert", "texture.0.30", "GDD", "AI")
+```
+
+
+#### Continuous predictors {.tabset .tabset-fade .tabset-pills}
+```{r PDP_Continuous_Functions, eval=TRUE, echo=FALSE}
+PlotPDPContinuous <- function(pred, span, ylimits, myxlab) {
+  # Plots the partial dependence plot for a continuous predictor
+  #
+  # Args:
+  #  pred: character string of the predictor
+  #  span: value for the smooth.span argument. Controls the amount of smoothing for the loess smoother 
+  #  ylimits: numeric vector giving the y-axis limits
+  #  myxlab: character string for the x-axis label
+  #
+  # Returns:
+  #  a partial dependence plot
+  #
+  pdp::partial(rfo, train = datII, pred.var = pred, cats = cat.vars) %>%
+  autoplot(smooth = TRUE, smooth.method = "loess", smooth.formula = y ~ x, smooth.span = span) +
+  theme_light() +
+  ylim(ylimits) +
+  xlab(myxlab) +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+}
+```
+
+
+##### Latitude
+```{r PDP_latitude, eval=TRUE, echo=FALSE, fig.height=4.0}
+PlotPDPContinuous(pred = "latitude", span = 0.4, ylimits = c(45, 65), myxlab = "Latitude")
+```
+
+##### Day-of-Year
+```{r PDP_doy, eval=TRUE, echo=FALSE, fig.height=4.0}
+PlotPDPContinuous(pred = "doy", span = 0.4, ylimits = c(45, 65), myxlab = "Day-of-Year")
+```
+
+##### Topsoil pH
+```{r PDP_topsoilpH, eval=TRUE, echo=FALSE, fig.height=4.0}
+PlotPDPContinuous(pred = "pH.0.30.cm", span = 0.4, ylimits = c(45, 65), myxlab = "Topsoil pH")
+```
+
+##### Topsoil organic matter content  
+This reflects soil health, in that you want some organic matter in the soil.
+```{r PDP_topsoilOM, eval=TRUE, echo=FALSE, fig.height=4.0}
+PlotPDPContinuous(pred = "OM.0.30.cm", span = 0.4, ylimits = c(45, 65), myxlab = "Topsoil organic matter (%)")
+```
+
+##### Seeding rate  
+NOTE: this may be an example of where the global interpretation is misleading.  On the surface it would suggest optimal seeding rates that are far higher than recommended (at least for IA and IN). We know that the more northerly plantings are sown at higher rates, so this ought to be conditioned on latitude or soybean maturity group.
+
+Do not blindly trust your model.
+```{r PDP_seedrate, eval=TRUE, echo=FALSE, fig.height=4.0}
+PlotPDPContinuous(pred = "seed.rate", span = 0.4, ylimits = c(45, 65), myxlab = "Seeding rate (1,000 seeds/acre)")
+```
+
+##### Topographic wetness index 
+```{r PDP_TWI, eval=TRUE, echo=FALSE, fig.height=4.0}
+PlotPDPContinuous(pred = "TWI", span = 0.4, ylimits = c(45, 65), myxlab = "Topographic wetness index")
+```
+
+
+------------------------------------------------------------------------------------------------------
+
+
+#### Categorical predictors {.tabset .tabset-fade .tabset-pills}
+```{r PDP_Categorical_Functions, eval=TRUE, echo=FALSE}
+# In order to set up the tidy evaluation properly, I had to consult this blog:
+# https://edwinth.github.io/blog/dplyr-recipes/
+
+PlotPDPCategorical <- function(pred.var, levels, labels, x.label = NULL, ylimits = c(45, 65)) {
+  # Produces a partial dependence plot for a categorical predictor.
+  #
+  # Args:
+  #  pred.var: the categorical variable (not quoted)
+  #  levels: character string giving the factor levels for the variable
+  #  labels: character string giving the labels for the factor levels
+  #  x.label: character string for the x-axis title
+  #
+  # Returns:
+  #  a partial dependence plot for the variable
+  
+  pred <- enquo(pred.var)
+  pred.name <- quo_name(pred)
+  
+  pdp::partial(rfo, train = datII, pred.var = pred.name, cats = cat.vars) %>% 
+  dplyr::mutate(!!pred.name := factor(!!pred, levels = levels, labels = labels)) %>% 
+  dplyr::mutate(lower = yhat + 0, upper = yhat + 0) %>%
+  ggplot(., aes(x = !!pred, y = yhat)) + 
+  geom_crossbar(aes(ymin = lower, ymax = upper), width = 0.3) +
+  ylim(ylimits) +
+  theme_light() +
+  xlab(x.label) +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+}  # end PlotPDPCategorical
+```
+
+
+##### GDD
+Recall that the annualized GDD (growing degree days) component of TEDs can take on 10 distinct values, but only 5 GDD values are in the data.
+
+These are:  
+
+*  01:  0 -- 2670 $^\circ$Cd
+*  02: 2671 -- 3169 $^\circ$Cd
+*  03: 3170 -- 3791 $^\circ$Cd
+*  04: 3792 -- 4829 $^\circ$Cd
+*  05: 4830 -- 5949 $^\circ$Cd
+
+```{r PDP_GDD, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- c("01", "02", "03", "04", "05")
+labs <- c("0-2670", "2671-3169", "3170-3791", "3792-4829", "4830-5949")
+PlotPDPCategorical(GDD, levels = levs, labels = labs, x.label = "GDD")
+```
+
+##### Soybean maturity group
+```{r PDP_MG, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- c("0", "I", "II", "III", "IV")
+labs <- levs
+PlotPDPCategorical(MG.f, levels = levs, labels = labs, x.label = "Maturity group")
+```
+
+##### Annual aridity index (AI)
+AI can take on 10 distinct values, but only 8 AI values are in the data.
+
+These are:
+\begin{itemize}
+  \item 1:  2696 -- 3893
+  \item 2:  3894 -- 4791
+  \item 3:  4792 -- 5689
+  \item 4:  5690 -- 6588
+  \item 5:  6589 -- 7785
+  \item 6:  7786 -- 8685
+  \item 7:  8686 -- 10181
+  \item 8:  10182 -- 12876
+\end{itemize}
+
+```{r PDP_AI, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- c("1", "2", "3", "4", "5", "6", "7", "8")
+labs <- c("2696-3893", "3894-4791", "4792-5689", "5690-6588", "6589-7785", "7786-8685", "8686-10181", "10182-12876")
+PlotPDPCategorical(AI, levels = levs, labels = labs, x.label = "Aridity index (annualized")
+```
+
+##### Foliar fungicide use
+```{r PDP_FoliarFungicide, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$foliar.fungicide)
+labs <- c("No", "Yes")
+PlotPDPCategorical(foliar.fungicide, levels = levs, labels = labs, x.label = "Foliar fungicide")
+```
+
+##### Topsoil texture
+```{r PDP_TopsoilTexture, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$texture.0.30)
+labs <- levs
+PlotPDPCategorical(texture.0.30, levels = levs, labels = labs, x.label = "Topsoil texture")
+```
+
+##### PAWR
+PAWR means "plant available water holding capacity in the rooting zone", and ranges from 0 to 300+ mm. The group had created seven 50-mm ranges for simplification. The numbers/classes that they used to classify PAWR were derived from a numerical code developed to account for other climate variables. You can read more about it [in this link](http://www.yieldgap.org/web/guest/cz-ted).
+
+From the link: 
+\begin{quoting}
+Plant-available soil water holding capacity in the root zone was taken from gSSURGO database (Soil Survey Staff; Resolution of 250 $\times$ 250 m). The 100000 -- 700000 are set up this way because they are used to further define TEDs.
+\end{quoting}
+
+But in essence they are categories for PAWR:
+\begin{itemize}
+  \item 100000 = 0 -- 50 mm
+  \item 200000 = 50 -- 100 mm
+  \item 300000 = 100 -- 150 mm
+  \item 400000 = 150 -- 200 mm
+  \item 500000 = 200 -- 250 mm
+  \item 600000 = 250 -- 300 mm
+  \item 700000 = 300+ mm
+\end{itemize}
+
+
+To simplify, we use the following categorical labels:
+\begin{itemize}
+  \item 1 = 0 -- 50 mm
+  \item 2 = 50 -- 100 mm
+  \item 3 = 100 -- 150 mm
+  \item 4 = 150 -- 200 mm
+  \item 5 = 200 -- 250 mm
+  \item 6 = 250 -- 300 mm
+  \item 7 = 300+ mm
+\end{itemize}
+
+```{r PDP_PAWR, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$PAWR)
+labs <- c("0-50", "50-100", "100-150", "150-200", "200-250", "250-300", "300+")
+PlotPDPCategorical(PAWR, levels = levs, labels = labs, x.label = "Plant available water holding capacity in the rooting zone (mm)")
+```
+
+##### Row spacing
+```{r PDP_RowSpace, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$row.space)
+labs <- c("7-7.5", "10", "15", "22", "30")
+PlotPDPCategorical(row.space, levels = levs, labels = labs, x.label = "Row spacing (inches)")
+```
+
+##### Herbicide
+```{r PDP_Herbicide, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$herbicide)
+labs <- c("None", "Pre-only", "Post-only", "Pre and Post")
+PlotPDPCategorical(herbicide, levels = levs, labels = labs, x.label = "Herbicide use")
+```
+
+##### Foliar insecticide
+```{r PDP_FoliarInsecticide, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$foliar.insecticide)
+labs <- c("No", "Yes")
+PlotPDPCategorical(foliar.insecticide, levels = levs, labels = labs, x.label = "Foliar insecticide use")
+```
+
+##### Seed treatments  
+```{r PDP_seed_trt1, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$seed.trt1)
+labs <- c("No", "Yes")
+PlotPDPCategorical(seed.trt1, levels = levs, labels = labs, x.label = "Seed treatment use")
+```
+
+##### Starter fertilizer
+```{r PDP_StarterFert, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$starter.fert)
+labs <- c("No", "Yes")
+PlotPDPCategorical(starter.fert, levels = levs, labels = labs, x.label = "Starter fertilizer")
+```
+
+##### Iron deficiency
+```{r PDP_IronDef, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$iron.def)
+labs <- c("No", "Yes")
+PlotPDPCategorical(iron.def, levels = levs, labels = labs, x.label = "Iron deficiency")
+```
+
+##### Manure
+```{r PDP_Manure, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$manure)
+labs <- c("No", "Yes")
+PlotPDPCategorical(manure, levels = levs, labels = labs, x.label = "Manure application")
+```
+
+##### Lime
+```{r PDP_Lime, eval=TRUE, echo=FALSE, fig.height=4.0}
+levs <- levels(datII$lime)
+labs <- c("No", "Yes")
+PlotPDPCategorical(lime, levels = levs, labels = labs, x.label = "Lime application")
+```
+
+
+------------------------------------------------------------------------------------------------
+
+
+### Multi-predictor PDPs {.tabset .tabset-fade .tabset-pills}
+
+```{r MPDP_load_objects, eval=TRUE, echo=FALSE}
+# The multi-predictor PDPs take quite some time to create, so I have saved the objects and just load them:
+# load("~/EskerSoybean/ScientificReportsGitHub/Analysis/MPDPII.RData")
+
+load("../Data/MPDPII.RData")
+```
+
+
+#### latitude and GDD
+```{r MPDP_latitude_GDD, eval=TRUE, echo=FALSE}
+## NOTE: could use parallel processing, as per the code below. But it does not seem well optimized within the function: not a lot of time savings, and there is a warning message (<anonymous>: ... may be used in an incorrect context: ‘.fun(piece, ...)’).
+
+# ## Configure parallel processing
+# cluster <- parallel::makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+# doParallel::registerDoParallel(cluster)
+# 
+# pd <- pdp::partial(rfo, train = datII, pred.var = c("latitude", "GDD"), parallel = TRUE, paropts = list(.packages = "ranger"))
+# 
+# stopCluster(cluster)
+# registerDoSEQ()
+
+# mpdp.lat.GDD <- pdp::partial(rfo, train = datII, pred.var = c("latitude", "GDD"))
+
+wireframe(yhat ~ latitude*GDD, data = mpdp.lat.GDD,
+  xlab = "Latitude", ylab = "GDD", zlab = "Yield",
+  main = NULL,
+  drape = TRUE,
+  colorkey = TRUE,
+  screen = list(z = -60, x = -60)
+)
+```
+
+#### latitude and doy (planting date)
+```{r MPDP_latitude_doy, eval=TRUE, echo=FALSE}
+# This takes a while to fit:
+# mpdp.lat.doy <- pdp::partial(rfo, train = datII, pred.var = c("latitude", "doy"))
+
+wireframe(yhat ~ latitude*doy, data = mpdp.lat.doy,
+  xlab = "Latitude", ylab = "Day of year", zlab = "Yield",
+  main = NULL,
+  drape = TRUE,
+  colorkey = TRUE,
+  screen = list(z = -60, x = -60)
+)
+```
+
+#### latitude and seed.rate
+```{r MPDP_latitude_seedrate, eval=TRUE, echo=FALSE}
+# mpdp.lat.seedrate <- pdp::partial(rfo, train = datII, pred.var = c("latitude", "seed.rate"))
+
+wireframe(yhat ~ latitude*seed.rate, data = mpdp.lat.seedrate,
+  xlab = "Latitude", ylab = "Seeding rate", zlab = "Yield",
+  main = NULL,
+  drape = TRUE,
+  colorkey = TRUE,
+  screen = list(z = -60, x = -60)
+)
+```
+
+#### Topsoil pH and organic matter content
+```{r MPDP_topsoilpH_topsoilOM, eval=TRUE, echo=FALSE}
+# mpdp.topsoil.pH.OM <- pdp::partial(rfo, train = datII, pred.var = c("pH.0.30.cm", "OM.0.30.cm"))
+
+wireframe(yhat ~ pH.0.30.cm*OM.0.30.cm, data = mpdp.topsoil.pH.OM,
+  xlab = "Topsoil pH", ylab = "Topsoil organic matter (%)", zlab = "Yield",
+  main = NULL,
+  drape = TRUE,
+  colorkey = TRUE,
+  screen = list(z = -60, x = -60)
+)
+```
+
+
+```{r save_MPPDP, eval=FALSE, echo=FALSE}
+# Save the model objects, because this took a long time to run:
+save(mpdp.lat.GDD, mpdp.lat.doy, mpdp.lat.seedrate, mpdp.topsoil.pH.OM, file = "MPDPII.RData")
+```
+
+
+-------------------------------------------------------------------------------------------------
+
+
+### ICE curves {.tabset .tabset-fade .tabset-pills}
+#### Introduction
+ICE (Individual conditional expectation) is a newer and less well-known adaptation of partial-dependence plots, can be used to create local explanations using the same ideas as partial-dependence plots. More details are in Section 16.5 of Boehmke and GreenWell (2020). There is direct support for `ranger` objects in the `pdp` package, so you don't need to create a custom prediction function.
+
+Centered ICE curves can help draw out further details. From [the Interpretable Machine Learning book](https://christophm.github.io/interpretable-ml-book/ice.html). There is a problem with ICE plots: Sometimes it can be hard to tell whether the ICE curves differ between individuals because they start at different predictions. A simple solution is to center the curves at a certain point in the feature and display only the difference in the prediction to this point. The resulting plot is called centered ICE plot (c-ICE). Anchoring the curves at the lower end of the feature is a good choice.
+
+The centered ICE plots make it easier to compare the curves of individual instances. This can be useful if we do not want to see the absolute change of a predicted value, but the difference in the prediction compared to a fixed point of the feature range.
+
+ICE plots depict how a model behaves for a single row of data and can be used to validate
+monotonicity constraints. ICE pairs nicely with partial dependence in the same plot to provide local information to augment the global information provided by partial dependence. ICE can detect when partial dependence fails in the presence of strong interactions among input variables. 
+
+Some practitioners feel that ICE can be misleading in the presence of strong correlations between input variables.
+
+We'll use ICE only with the two most important continuous predictors (latitude and day-of-year).
+
+We'll use latitude to illustrate uncentered ICE, and day-of-year for centered ICE curves.
+
+#### latitude  {.tabset .tabset-fade .tabset-pills}
+##### Non-centered
+```{r ICE_latitude_noncentered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "latitude", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1) +
+  xlab("Latitude") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+##### Centered
+```{r ICE_latitude_centered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "latitude", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1, center = TRUE) +
+  xlab("Latitude") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+
+#### day-of-year {.tabset .tabset-fade .tabset-pills}
+For day-of-year (planting date), higher yields are associated with early planting (before about the first week of May), with yields steadily decreasing as planting is delayed beyond that period. 
+
+##### Non-centered
+```{r ICE_doy_noncentered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "doy", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1) +
+  xlab("Day of year") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+##### Centered
+```{r ICE_doy_centered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "doy", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1, center = TRUE) +
+  xlab("Day of year") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+
+#### Topsoil pH {.tabset .tabset-fade .tabset-pills}
+##### Non-centered
+```{r ICE_topsoilpH_noncentered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "pH.0.30.cm", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1) +
+  xlab("Topsoil pH") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+##### Centered
+```{r ICE_topsoilpH_centered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "pH.0.30.cm", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1, center = TRUE) +
+  xlab("Topsoil pH") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+
+#### Seeding rate {.tabset .tabset-fade .tabset-pills}
+##### Non-centered
+```{r ICE_seedrate_noncentered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "seed.rate", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1) +
+  xlab("Seeding rate (1,000 seeds/acre)") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+##### Centered
+```{r ICE_seedrate_centered, eval=TRUE, echo=FALSE, fig.height=5.0}
+rfo %>%
+pdp::partial(train = datII, pred.var = "seed.rate", ice = TRUE, quantiles = TRUE, probs = 0:20/20) %>%
+  autoplot(train = datII, alpha = 0.1, center = TRUE) +
+  xlab("Seeding rate (1,000 seeds/acre)") +
+  ylab("Yield (bu/acre)") +
+  theme(axis.title.x = element_text(face = "bold", size = 12),
+        axis.text.x  = element_text(size = 9, angle = 0),
+        axis.title.y = element_text(size = 12, angle = 90, face = "bold"),
+        axis.text.y  = element_text(size = 9))
+```
+
+
+```{r ICE_pdp_cleanup, eval=TRUE, echo=FALSE}
+rm(list = ls()[!(ls() %in% c("caret_rf", "dat", "datII", "rfo", "x", "y"))])
+```
+
+
+PDP and ICE visualizations help us to understand our model from a global perspective: identifying the variables with the largest overall impact and the typical influence of a feature on the response variable across all observations. 
+
+However, what these do not help us understand is given a new observation, what were the most influential variables that determined the predicted outcome. We would like to understand what variables are most influential for a specific observation. This is where `lime` can help.
+
+
+-------------------------------------------------------------------------------------------------------
+
+```{r LIME, child='LIMEII.Rmd', eval=TRUE, echo=FALSE}
+```
+
+-------------------------------------------------------------------------------------------------------
+
+```{r IML, child='iml_II.Rmd', eval=TRUE, echo=FALSE}
+```
+
+-------------------------------------------------------------------------------------------------------
+
+```{r IML_Shap_Fung, child='Shapley_II.Rmd', eval=TRUE, echo=FALSE}
+```
+
+-------------------------------------------------------------------------------------------------------
+
+
+# Computing environment
+```{r SessionInfo, eval=TRUE, echo=FALSE}
+# Last run on R version 3.5.3 (2019-03-11)
+R.Version()$version.string
+R.Version()$system
+sessionInfo()
+```
